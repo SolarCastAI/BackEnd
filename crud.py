@@ -1,10 +1,14 @@
+import math
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import func, and_
-import models, schemas
+from sqlalchemy.dialects.postgresql import insert
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta, date
-import math
+
+# --- 로컬 모듈 임포트 ---
+import models
+import schemas
 
 # (참고) DB 스키마(models.py)와 프론트엔드 요구(schemas.py) 간의 단위 변환
 # - DB: generation_mwh (메가와트시), capacity_mw (메가와트)
@@ -219,3 +223,59 @@ async def check_region_exists(db: AsyncSession, region_name: str) -> bool:
     query = select(models.Region).where(models.Region.name == region_name)
     result = await db.execute(query)
     return result.first() is not None
+
+async def save_forecast_results(
+    db: AsyncSession, 
+    region_id: int, 
+    model_name: str, 
+    model_ver: str, 
+    predictions: List[dict]
+):
+    """
+    AI 모델의 예측 결과를 `forecast_ts` 테이블에 저장합니다.
+    (UPSERT: 이미 데이터가 있으면 덮어쓰기)
+    """
+    
+    # 1. DB에 저장할 객체(dict) 리스트 생성
+    objects_to_save = []
+    generated_at_time = datetime.utcnow() # 현재 시간 (UTC)
+
+    for pred in predictions:
+        # 프론트에서 온 'ts' 문자열을 datetime 객체로 변환
+        ts_datetime = datetime.fromisoformat(pred["ts"].replace("Z", "+00:00"))
+        
+        objects_to_save.append({
+            "ts": ts_datetime, # 예측 시각
+            "region_id": region_id,
+            "horizon": 0, # (예시: horizon 계산 로직 필요시 추가)
+            "gen_pred_kwh": pred["predicted_kwh"],
+            "model": model_name,
+            "ver": model_ver,
+            "generated_at": generated_at_time # 예측 생성 시각
+        })
+
+    if not objects_to_save:
+        print("DB에 저장할 예측 결과가 없습니다.")
+        return # 저장할 것이 없으면 종료
+
+    # 2. `insert` 문 정의
+    # (SQLAlchemy 1.x 방식)
+    stmt = insert(models.ForecastTs).values(objects_to_save)
+
+    # 3. "ON CONFLICT" (UPSERT) 정의
+    # (ts, region_id, horizon, model, ver)가 겹치면
+    # `gen_pred_kwh`와 `generated_at` 값을 새로 덮어쓰기
+    stmt = stmt.on_conflict_do_update(
+        # 충돌 감지 기준 (forecast_ts의 복합 기본 키)
+        index_elements=['ts', 'region_id', 'horizon', 'model', 'ver'],
+        # 덮어쓸 값
+        set_={
+            "gen_pred_kwh": stmt.excluded.gen_pred_kwh,
+            "generated_at": stmt.excluded.generated_at
+        }
+    )
+
+    # 4. DB에 일괄 실행
+    await db.execute(stmt)
+    await db.commit()
+    print(f"✅ 예측 결과 {len(objects_to_save)}건 DB 저장 완료")
