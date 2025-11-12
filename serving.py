@@ -17,7 +17,7 @@ import xgboost as xgb
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
-
+import time
 # GPU/CUDA 설정
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 print(f"🚀 사용 중인 디바이스: {device}")
@@ -551,6 +551,9 @@ def predict_multiple_horizons_realtime(current_data, models_dict, current_dateti
 # === 메인 실행 함수 ===
 if __name__ == "__main__":
     try:
+	 
+        start = time.time() # 시작
+        
         # 현재 날짜 및 시간 자동 설정 (2025년 11월 10일)
         CURRENT_DATETIME = datetime(2025, 11, 10, datetime.now().hour)
         
@@ -601,6 +604,12 @@ if __name__ == "__main__":
         print(f"\n{'='*80}")
         print("✅ 예측 완료!")
         print(f"{'='*80}")
+
+        end_time = time.time()-start # 종료 - 시작 (걸린 시간)
+	 
+        times = str(timedelta(seconds=end_time)) # 걸린시간 보기좋게 바꾸기
+        short = times.split(".")[0] # 초 단위 까지만
+        print(f"serving.py 실행 시간 : {times} sec")
         
     except FileNotFoundError as e:
         print(f"\n❌ 오류: {e}")
