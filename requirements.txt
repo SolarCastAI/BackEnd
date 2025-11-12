@@ -1,1 +1,6 @@
 fastapi[all]
+torch
+numpy
+pandas
+xgboost
+scikit-learn
