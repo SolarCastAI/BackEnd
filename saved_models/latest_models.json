@@ -1,0 +1,8 @@
+{
+    "timestamp": "20251112_193519",
+    "lstm_model": "./saved_models\\lstm_model_20251112_193519.pth",
+    "gru_model": "./saved_models\\gru_model_20251112_193519.pth",
+    "xgboost_model": "./saved_models\\xgboost_stacking_20251112_193519.json",
+    "scalers": "./saved_models\\scalers_20251112_193519.pkl",
+    "metadata": "./saved_models\\metadata_20251112_193519.json"
+}
