@@ -1,7 +1,9 @@
-fastapi==0.104.1
-uvicorn==0.24.0
-pydantic==2.5.0
-python-multipart==0.0.6
+fastapi[all]
+torch
+numpy
+pandas
+scikit-learn
+xgboost
 
 # --- DB 연동을 위해 아래 4개 추가 ---
 sqlalchemy     # ORM (필수)
