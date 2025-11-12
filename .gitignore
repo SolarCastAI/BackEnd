@@ -1,0 +1,6 @@
+# Python
+venv/
+__pycache__/
+
+# Secrets (절대 올리면 안 됨)
+.env

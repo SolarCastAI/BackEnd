@@ -1,10 +1,17 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
 from typing import List, Optional
-from datetime import datetime, timedelta
-import random
-import os
+from datetime import datetime
+
+# --- 로컬 모듈 임포트 ---
+import crud, models, schemas  # crud, models, schemas 모듈
+from database import async_session, engine, Base  # DB 세션
+from schemas import DashboardSummary, RegionPowerData, PowerForecast # Pydantic 모델
+
+# (SQLAlchemy 등 다른 임포트...)
+
+# --- SQLAlchemy 관련 모듈 ---
+from sqlalchemy.ext.asyncio import AsyncSession
 
 app = FastAPI(title="SolarCast API")
 
@@ -17,78 +24,45 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ==================== 데이터 모델 ====================
+# (선택) 서버 시작 시 DB 테이블 생성 (개발용)
+# @app.on_event("startup")
+# async def startup_event():
+#     async with engine.begin() as conn:
+#         await conn.run_sync(Base.metadata.create_all)
 
-class DashboardSummary(BaseModel):
-    """대시보드 요약 정보"""
-    currentKw: float      # 현재 발전량 (Kw)
-    todayKwh: float       # 오늘의 누적 발전량 (Kwh)
-    accuracy: float       # 예측 정확도 (%)
-    stability: str        # 시스템 안정도
-    today_date: str       # 오늘 날짜
+# ==================== DB 세션 의존성 함수 ====================
 
-class RegionPowerData(BaseModel):
-    """지역별 발전량 데이터"""
-    name: str             # 지역명
-    kwh: float            # 발전량 (Kwh)
-    revenue: int          # 수익 (원)
-    id: str               # 지역 ID
-    latitude: Optional[float] = None   # 위도 (선택)
-    longitude: Optional[float] = None  # 경도 (선택)
+async def get_db() -> AsyncSession:
+    """
+    API 요청마다 비동기 DB 세션을 생성하고 반환합니다.
+    """
+    async with async_session() as session:
+        try:
+            yield session
+        except Exception as e:
+            await session.rollback()
+            raise e
+        finally:
+            await session.close()
 
-class PowerForecast(BaseModel):
-    """시간대별 발전량 예측"""
-    time: str             # 시간
-    actual: Optional[float]    # 실제 발전량
-    predicted: float      # 예측 발전량
+# ==================== Pydantic 데이터 모델 ====================
+#
+# (이전 main.py에 있던 Pydantic 모델들은 
+#  crud.py와의 순환 참조를 피하기 위해
+#  schemas.py 파일로 분리되었습니다.)
+#
+# ==========================================================
 
-# ==================== 임시 데이터 ====================
 
-# 지역별 데이터
-regions_data = [
-    {"region": "서울", "id": "seoul", "power": 4850, "revenue": 843900, "lat": 37.5665, "lng": 126.9780},
-    {"region": "부산", "id": "busan", "power": 5240, "revenue": 911760, "lat": 35.1796, "lng": 129.0756},
-    {"region": "대구", "id": "daegu", "power": 4650, "revenue": 809100, "lat": 35.8714, "lng": 128.6014},
-    {"region": "인천", "id": "incheon", "power": 4720, "revenue": 821280, "lat": 37.4563, "lng": 126.7052},
-    {"region": "대전", "id": "daejeon", "power": 4100, "revenue": 713400, "lat": 36.3504, "lng": 127.3845},
-]
+# ==================== 임시 데이터 (모두 제거) ====================
+#
+# (regions_data, generate_power_data 함수 등
+#  Mock 데이터는 crud.py의 DB 연동으로 대체되어 모두 제거되었습니다.)
+#
+# ==========================================================
 
-# 시간대별 발전량 데이터 생성 함수
-def generate_power_data(hours: int = 24):
-    """시간대별 발전량 데이터 생성"""
-    data = []
-    base_time = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
-    
-    for i in range(hours):
-        time = (base_time + timedelta(hours=i)).strftime("%H:%M")
-        
-        # 낮 시간대에 발전량이 높도록 설정
-        hour = i % 24  # 48H, 72H 대응
-        if 6 <= hour <= 18:
-            base_power = 200 + (hour - 6) * 30
-            if hour > 12:
-                base_power = 200 + (18 - hour) * 30
-        else:
-            base_power = 10
-        
-        # 실제 발전량 (현재 시간까지만)
-        actual = None
-        current_hour = datetime.now().hour
-        if i < 24 and i <= current_hour:
-            actual = base_power + random.uniform(-20, 20)
-        
-        # 예측 발전량
-        predicted = base_power + random.uniform(-15, 15)
-        
-        data.append({
-            "time": time,
-            "actual": round(actual, 2) if actual else None,
-            "predicted": round(predicted, 2)
-        })
-    
-    return data
 
-# ==================== API 엔드포인트 ====================
+# ==================== API 엔드포인트 (DB 연동) ====================
 
 @app.get("/")
 def read_root():
@@ -104,55 +78,45 @@ def read_root():
     }
 
 @app.get("/api/dashboard/summary", response_model=DashboardSummary)
-def get_dashboard_summary():
-    """대시보드 요약 정보 조회"""
-    # 요일을 한글로 변환
-    weekdays = ['월', '화', '수', '목', '금', '토', '일']
-    weekday_kr = weekdays[datetime.now().weekday()]
+async def get_dashboard_summary(db: AsyncSession = Depends(get_db)):
+    """대시보드 요약 정보 조회 (DB 연동)"""
     
+    # crud.py의 함수가 DB에서 실제 데이터를 계산하여 반환 (Dict 형태)
+    summary_data = await crud.get_dashboard_summary(db)
+    
+    # Pydantic 모델로 응답 반환
     return DashboardSummary(
-        currentKw=round(random.uniform(300, 350), 1),
-        todayKwh=round(random.uniform(4500, 4600), 0),
-        accuracy=round(random.uniform(96, 99), 1),
-        stability="Normal",
-        today_date=datetime.now().strftime(f"%m/%d({weekday_kr})")
+        current_power=summary_data["current_power"],
+        today_total=summary_data["today_total"],
+        accuracy=summary_data["accuracy"],
+        today_date=datetime.now().strftime("%m/%d(%a)")
     )
 
 @app.get("/api/regions", response_model=List[RegionPowerData])
-def get_regions_data():
-    """지역별 발전량 데이터 조회"""
-    return [
-        RegionPowerData(
-            name=region["region"],
-            kwh=round(region["power"] + random.uniform(-100, 100), 1),
-            revenue=region["revenue"] + random.randint(-10000, 10000),
-            id=region["id"],
-            latitude=region["lat"],
-            longitude=region["lng"]
-        )
-        for region in regions_data
-    ]
+async def get_regions_data(db: AsyncSession = Depends(get_db)):
+    """지역별 발전량 데이터 조회 (DB 연동)"""
+    
+    # crud.py가 DB에서 조회/계산한 RegionPowerData 모델 리스트를 반환
+    regions_from_db = await crud.get_regions_data(db)
+    
+    # Pydantic 모델 리스트를 반환하면 FastAPI가 JSON 리스트로 직렬화
+    return regions_from_db
 
 @app.get("/api/regions/{region_name}", response_model=RegionPowerData)
-def get_region_data(region_name: str):
-    """특정 지역 발전량 데이터 조회"""
-    region = next((r for r in regions_data if r["region"] == region_name or r["id"] == region_name), None)
+async def get_region_data(region_name: str, db: AsyncSession = Depends(get_db)):
+    """특정 지역 발전량 데이터 조회 (DB 연동)"""
+    
+    # crud.py에서 특정 지역의 데이터를 조회 (RegionPowerData 모델 반환)
+    region = await crud.get_region_data(db, region_name)
     
     if not region:
         raise HTTPException(status_code=404, detail=f"지역 '{region_name}'을 찾을 수 없습니다.")
     
-    return RegionPowerData(
-        name=region["region"],
-        kwh=round(region["power"] + random.uniform(-100, 100), 1),
-        revenue=region["revenue"] + random.randint(-10000, 10000),
-        id=region["id"],
-        latitude=region["lat"],
-        longitude=region["lng"]
-    )
+    return region
 
 @app.get("/api/forecast/{hours}", response_model=List[PowerForecast])
-def get_power_forecast(hours: int = 24):
-    """시간대별 발전량 예측 데이터 조회
+async def get_power_forecast(hours: int = 24, db: AsyncSession = Depends(get_db)):
+    """시간대별 발전량 예측 데이터 조회 (DB 연동)
     
     Args:
         hours: 예측 시간 (24, 48, 72)
@@ -160,23 +124,30 @@ def get_power_forecast(hours: int = 24):
     if hours not in [24, 48, 72]:
         raise HTTPException(status_code=400, detail="hours는 24, 48, 72 중 하나여야 합니다.")
     
-    data = generate_power_data(hours)
-    return [PowerForecast(**item) for item in data]
+    # crud.py에서 forecast_ts(예측)와 generation_ts(실제)를 조회하여 반환
+    data = await crud.get_power_forecast(db, hours)
+    return data
 
 @app.get("/api/download/csv/{region}")
-def download_csv_data(region: str):
-    """CSV 다운로드용 데이터 (실제로는 파일 생성 필요)"""
-    region_data = next((r for r in regions_data if r["region"] == region or r["id"] == region), None)
+async def download_csv_data(region: str, db: AsyncSession = Depends(get_db)):
+    """CSV 다운로드용 데이터 (DB 연동)"""
     
-    if not region_data:
+    # crud.py에서 데이터 존재 여부 확인
+    region_exists = await crud.check_region_exists(db, region)
+    
+    if not region_exists:
         raise HTTPException(status_code=404, detail=f"지역 '{region}'을 찾을 수 없습니다.")
     
-    # 실제로는 CSV 파일을 생성하고 FileResponse로 반환
+    # TODO:
+    # 1. crud.py에서 해당 지역의 CSV 데이터 생성 로직 호출
+    # 2. FileResponse 또는 StreamingResponse를 사용하여 실제 파일 반환
+    
+    # (임시로 JSON 응답 반환)
     return {
-        "message": f"{region} 지역 CSV 데이터 생성 완료",
+        "message": f"{region} 지역 CSV 데이터 생성 준비 완료 (구현 필요)",
         "region": region,
-        "data_points": 24,
-        "download_url": f"/api/download/csv/{region}/file"
+        "data_points": 24, # 예시
+        "download_url": f"/api/download/csv/{region}/file" # 가상 URL
     }
 
 @app.get("/health")
@@ -189,10 +160,5 @@ def health_check():
 
 if __name__ == "__main__":
     import uvicorn
-    # forecast_data 디렉토리 및 지역별 하위 디렉토리 생성
-    os.makedirs("forecast_data", exist_ok=True)
-    for region in [r["id"] for r in regions_data]:
-        os.makedirs(f"./forecast_data/{region}", exist_ok=True)
-
-
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # `reload=True`는 개발 중 코드 자동 리로딩을 위함
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)

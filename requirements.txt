@@ -1,6 +1,11 @@
-fastapi[all]
-torch
-numpy
-pandas
-xgboost
-scikit-learn
+fastapi==0.104.1
+uvicorn==0.24.0
+pydantic==2.5.0
+python-multipart==0.0.6
+
+# --- DB 연동을 위해 아래 4개 추가 ---
+sqlalchemy     # ORM (필수)
+asyncpg        # PostgreSQL 비동기 드라이버 (권장)
+python-dotenv  # .env 파일로 DB 접속정보 관리
+alembic        # (선택) 백엔드 프로젝트에서도 DB 스키마 관리시
+greenlet
