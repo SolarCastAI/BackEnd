@@ -1,29 +1,264 @@
-"""
-실시간 태양광 발전량 예측 시스템
-- 현재 시점(2025-11-10) 기준 예측
-- 24시간, 48시간, 72시간 이후 태양광 발전량 예측
-- 일자별 태양광 발전량 MWh 예측
-- 누적 발전량 표시
-"""
-
 import torch
 import torch.nn as nn
-import numpy as np
+import torch.optim as optim
+import torch.nn.functional as F 
+from torch.utils.data import Dataset, DataLoader
 import pandas as pd
+import numpy as np
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+import seaborn as sns
+import warnings
+import os
+import time
 import pickle
 import json
-import os
-import xgboost as xgb
 from datetime import datetime, timedelta
-import warnings
-warnings.filterwarnings('ignore')
-import time
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MinMaxScaler, StandardScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
+from sklearn.impute import SimpleImputer
+import xgboost as xgb
+
 # GPU/CUDA 설정
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print(f"🚀 사용 중인 디바이스: {device}")
+print(f" 사용 중인 디바이스: {device}")
+if torch.cuda.is_available():
+    print(f"   GPU: {torch.cuda.get_device_name(0)}")
+    print(f"   CUDA 버전: {torch.version.cuda}")
+    print(f"   GPU 메모리: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.1f} GB")
+    torch.cuda.empty_cache()
+    torch.backends.cudnn.benchmark = True
+else:
+    print("     CUDA를 사용할 수 없습니다. CPU를 사용합니다.")
+
+warnings.filterwarnings("ignore")
+
+# 디렉토리 설정
+output_dir = "./plots_daegu_transfer"
+model_dir = "./saved_models"  # 제주 백본 모델이 저장된 디렉토리
+
+os.makedirs(output_dir, exist_ok=True)
+
+print(f" Plot 저장 경로: {output_dir}")
+print(f" 제주 백본 모델 경로: {model_dir}")
+
+plt.style.use('seaborn-v0_8-whitegrid')
+
+# 한글 폰트 설정
+import matplotlib.font_manager as fm
+import platform
+
+def set_korean_font():
+    system = platform.system()
+    korean_fonts = ['Malgun Gothic', 'AppleGothic', 'NanumGothic', 
+                   'NanumBarunGothic', 'Nanum Gothic', 'DejaVu Sans']
+    available_fonts = [f.name for f in fm.fontManager.ttflist]
+    
+    for font in korean_fonts:
+        if font in available_fonts:
+            plt.rcParams['font.family'] = font
+            print(f" 한글 폰트 설정 완료: {font}")
+            break
+    else:
+        print("  한글 폰트를 찾을 수 없습니다.")
+    
+    plt.rcParams['axes.unicode_minus'] = False
+
+set_korean_font()
 
 
-# === 모델 클래스 정의 (학습 코드와 동일) ===
+# === 평가 지표 함수들 ===
+def calculate_rmse(y_true, y_pred):
+    return np.sqrt(mean_squared_error(y_true, y_pred))
+
+def calculate_r2(y_true, y_pred):
+    return r2_score(y_true, y_pred)
+
+def calculate_mape(y_true, y_pred, method='improved'):
+    y_true = np.array(y_true, dtype=np.float64)
+    y_pred = np.array(y_pred, dtype=np.float64)
+    
+    valid_mask = np.isfinite(y_true) & np.isfinite(y_pred)
+    y_true_clean = y_true[valid_mask]
+    y_pred_clean = y_pred[valid_mask]
+    
+    if len(y_true_clean) == 0:
+        return np.nan
+    
+    if method == 'improved':
+        threshold = np.percentile(y_true_clean, 10)
+        significant_mask = y_true_clean >= threshold
+        
+        if not np.any(significant_mask):
+            abs_errors = np.abs(y_true_clean - y_pred_clean)
+            mean_actual = np.mean(y_true_clean)
+            if mean_actual > 0:
+                return (np.mean(abs_errors) / mean_actual) * 100
+            else:
+                return 0.0
+        
+        y_true_sig = y_true_clean[significant_mask]
+        y_pred_sig = y_pred_clean[significant_mask]
+        
+        weights = y_true_sig / np.sum(y_true_sig)
+        percentage_errors = np.abs((y_true_sig - y_pred_sig) / y_true_sig)
+        percentage_errors = np.clip(percentage_errors, 0, 2)
+        
+        mape_value = np.sum(weights * percentage_errors) * 100
+        
+    return mape_value
+
+def calculate_all_metrics(y_true, y_pred, print_details=False):
+    metrics = {
+        'mae': mean_absolute_error(y_true, y_pred),
+        'rmse': calculate_rmse(y_true, y_pred),
+        'r2': calculate_r2(y_true, y_pred),
+        'mape': calculate_mape(y_true, y_pred, method='improved'),
+    }
+    
+    data_range = np.max(y_true) - np.min(y_true)
+    metrics['nmae'] = metrics['mae'] / data_range if data_range > 0 else 0
+    metrics['nrmse'] = metrics['rmse'] / data_range if data_range > 0 else 0
+    
+    if print_details:
+        print(f"\n=== 평가 지표 ===")
+        print(f"MAE: {metrics['mae']:.4f}")
+        print(f"RMSE: {metrics['rmse']:.4f}")
+        print(f"NMAE: {metrics['nmae']:.4f}")
+        print(f"NRMSE: {metrics['nrmse']:.4f}")
+        print(f"R²: {metrics['r2']:.4f}")
+        print(f"MAPE: {metrics['mape']:.2f}%")
+    
+    return metrics
+
+
+# load_daegu_data 함수 내에서 feature_cols 부분을 수정
+def load_daegu_data(file_path, sequence_length=24):
+    """
+    대구 CSV 데이터 로딩 및 전처리
+    """
+    print("\n" + "="*80)
+    print("대구 데이터 로딩 중...")
+    print("="*80)
+    
+    df = pd.read_csv(file_path)
+    print(f"원본 데이터 크기: {df.shape}")
+    print(f"컬럼: {df.columns.tolist()}")
+    
+    # 날짜 처리
+    df['발전일자'] = pd.to_datetime(df['발전일자'])
+    
+    # 컬럼 매핑
+    column_mapping = {
+        '발전일자': 'datetime',
+        '기온': 'temperature',
+        '강우량(mm)': 'precipitation',
+        '습도': 'humidity',
+        '적설량(mm)': 'snow',
+        '적운량(10분위)': 'cloud_cover',
+        '일조(hr)': 'sunshine_duration',
+        '일사량': 'solar_radiation',
+        '설비용량(MW)': 'solar_capacity',
+        '발전량(MWh)': 'solar_generation'
+    }
+    
+    df_renamed = df.rename(columns=column_mapping)
+    
+    # 결측치 처리
+    df_renamed['precipitation'] = df_renamed['precipitation'].fillna(0)
+    df_renamed['snow'] = df_renamed['snow'].fillna(0)
+    df_renamed['sunshine_duration'] = df_renamed['sunshine_duration'].fillna(0)
+    df_renamed['solar_radiation'] = df_renamed['solar_radiation'].fillna(0)
+    df_renamed['humidity'] = df_renamed['humidity'].fillna(df_renamed['humidity'].mean())
+    df_renamed['temperature'] = df_renamed['temperature'].fillna(df_renamed['temperature'].mean())
+    df_renamed['cloud_cover'] = df_renamed['cloud_cover'].fillna(5)
+    
+    # 시간 특성 추가
+    df_renamed['hour'] = df_renamed['datetime'].dt.hour
+    df_renamed['month'] = df_renamed['datetime'].dt.month
+    df_renamed['day_of_year'] = df_renamed['datetime'].dt.dayofyear
+    df_renamed['is_daytime'] = ((df_renamed['hour'] >= 6) & (df_renamed['hour'] <= 18)).astype(int)
+    
+    # 태양 고도각 (대구 위도 35.87)
+    latitude = 35.87
+    df_renamed['solar_altitude'] = np.sin(np.radians(
+        90 - latitude + 23.45 * np.sin(np.radians(360/365 * (df_renamed['day_of_year'] - 81)))
+    )) * np.sin(np.radians(15 * (df_renamed['hour'] - 12)))
+    
+    print(f"\n데이터 기간: {df_renamed['datetime'].min()} ~ {df_renamed['datetime'].max()}")
+    print(f"평균 발전량: {df_renamed['solar_generation'].mean():.2f} MWh")
+    print(f"설비용량: {df_renamed['solar_capacity'].iloc[0]:.2f} MW")
+    
+    #  제주 모델과 동일한 8개 특성만 선택
+    feature_cols = [
+        'temperature', 'precipitation', 'humidity', 'cloud_cover',
+        'sunshine_duration', 'solar_radiation', 'solar_capacity', 'hour'
+    ]
+    
+    print(f"\n  제주 모델 호환을 위해 {len(feature_cols)}개 특성 사용:")
+    print(f"   {feature_cols}")
+    
+    target_col = 'solar_generation'
+    
+    # 유효한 데이터만 선택
+    df_valid = df_renamed[df_renamed[target_col].notna()].copy()
+    
+    X = df_valid[feature_cols].values
+    y = df_valid[target_col].values.reshape(-1, 1)
+    dates = df_valid['datetime'].values
+    
+    # 스케일링
+    scaler_X = MinMaxScaler()
+    scaler_y = MinMaxScaler()
+    
+    X_scaled = scaler_X.fit_transform(X)
+    y_scaled = scaler_y.fit_transform(y)
+    
+    # 시퀀스 데이터 생성
+    X_seq, y_seq, date_seq = [], [], []
+    for i in range(len(X_scaled) - sequence_length):
+        X_seq.append(X_scaled[i:i+sequence_length])
+        y_seq.append(y_scaled[i+sequence_length])
+        date_seq.append(dates[i+sequence_length])
+    
+    X_seq = np.array(X_seq)
+    y_seq = np.array(y_seq)
+    
+    print(f"\n시퀀스 데이터 shape: X={X_seq.shape}, y={y_seq.shape}")
+    
+    # Train/Val/Test 분할 (80/10/10)
+    X_temp, X_test, y_temp, y_test, date_temp, date_test = train_test_split(
+        X_seq, y_seq, date_seq, test_size=0.1, random_state=42
+    )
+    X_train, X_val, y_train, y_val, date_train, date_val = train_test_split(
+        X_temp, y_temp, date_temp, test_size=0.111, random_state=42
+    )
+    
+    print(f"\n데이터 분할:")
+    print(f"  Train: {X_train.shape} ({len(X_train)/len(X_seq)*100:.1f}%)")
+    print(f"  Val: {X_val.shape} ({len(X_val)/len(X_seq)*100:.1f}%)")
+    print(f"  Test: {X_test.shape} ({len(X_test)/len(X_seq)*100:.1f}%)")
+    
+    return (X_train, X_val, X_test, y_train, y_val, y_test,
+            scaler_X, scaler_y, feature_cols, df_valid, date_test)
+
+
+# === PyTorch Dataset ===
+class TimeSeriesDataset(Dataset):
+    def __init__(self, X, y):
+        self.X = torch.FloatTensor(X)
+        self.y = torch.FloatTensor(y)
+    
+    def __len__(self):
+        return len(self.X)
+    
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx]
+
+
+# === LSTM 모델 ===
 class LSTMModel(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.2):
         super(LSTMModel, self).__init__()
@@ -31,9 +266,7 @@ class LSTMModel(nn.Module):
         self.num_layers = num_layers
         
         self.lstm = nn.LSTM(
-            input_size, 
-            hidden_size, 
-            num_layers, 
+            input_size, hidden_size, num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
@@ -47,6 +280,7 @@ class LSTMModel(nn.Module):
         return output
 
 
+# === GRU 모델 ===
 class GRUModel(nn.Module):
     def __init__(self, input_size, hidden_size=128, num_layers=2, dropout=0.2):
         super(GRUModel, self).__init__()
@@ -54,9 +288,7 @@ class GRUModel(nn.Module):
         self.num_layers = num_layers
         
         self.gru = nn.GRU(
-            input_size, 
-            hidden_size, 
-            num_layers, 
+            input_size, hidden_size, num_layers,
             batch_first=True,
             dropout=dropout if num_layers > 1 else 0
         )
@@ -70,11 +302,13 @@ class GRUModel(nn.Module):
         return output
 
 
-# === 모델 로드 함수 ===
-def load_trained_models(model_dir='./saved_models', timestamp=None):
-    """저장된 모델과 스케일러 로드"""
+# === 제주 모델 로드 함수 ===
+def load_jeju_pretrained_models(model_dir='./saved_models', timestamp=None):
+    """
+    제주 데이터로 사전학습된 모델 로드
+    """
     print(f"\n{'='*80}")
-    print("모델 로드 중...")
+    print("제주 사전학습 모델 로드 중...")
     print(f"{'='*80}")
     
     # 최신 모델 정보 로드
@@ -87,23 +321,14 @@ def load_trained_models(model_dir='./saved_models', timestamp=None):
             model_info = json.load(f)
         
         timestamp = model_info['timestamp']
-        print(f"✅ 최신 모델 타임스탬프: {timestamp}")
+        print(f"최신 모델 타임스탬프: {timestamp}")
     
     # 메타데이터 로드
     metadata_path = os.path.join(model_dir, f'metadata_{timestamp}.json')
     with open(metadata_path, 'r', encoding='utf-8') as f:
         metadata = json.load(f)
     
-    print(f"✅ 메타데이터 로드: {metadata_path}")
-    
-    # 스케일러 로드
-    scaler_path = os.path.join(model_dir, f'scalers_{timestamp}.pkl')
-    with open(scaler_path, 'rb') as f:
-        scalers = pickle.load(f)
-    
-    scaler_X = scalers['scaler_X']
-    scaler_y = scalers['scaler_y']
-    print(f"✅ 스케일러 로드: {scaler_path}")
+    print(f" 메타데이터 로드: {metadata_path}")
     
     # LSTM 모델 로드
     lstm_path = os.path.join(model_dir, f'lstm_model_{timestamp}.pth')
@@ -116,8 +341,7 @@ def load_trained_models(model_dir='./saved_models', timestamp=None):
         num_layers=lstm_config['num_layers']
     ).to(device)
     lstm_model.load_state_dict(lstm_checkpoint['model_state_dict'])
-    lstm_model.eval()
-    print(f"✅ LSTM 모델 로드: {lstm_path}")
+    print(f" LSTM 사전학습 모델 로드: {lstm_path}")
     
     # GRU 모델 로드
     gru_path = os.path.join(model_dir, f'gru_model_{timestamp}.pth')
@@ -130,491 +354,553 @@ def load_trained_models(model_dir='./saved_models', timestamp=None):
         num_layers=gru_config['num_layers']
     ).to(device)
     gru_model.load_state_dict(gru_checkpoint['model_state_dict'])
-    gru_model.eval()
-    print(f"✅ GRU 모델 로드: {gru_path}")
+    print(f" GRU 사전학습 모델 로드: {gru_path}")
     
-    # XGBoost 모델 로드
-    xgb_path = os.path.join(model_dir, f'xgboost_stacking_{timestamp}.json')
-    xgb_model = xgb.XGBRegressor()
-    xgb_model.load_model(xgb_path)
-    print(f"✅ XGBoost 스태킹 모델 로드: {xgb_path}")
-    
-    print(f"\n✨ 모든 모델이 성공적으로 로드되었습니다!")
-    
-    return {
-        'lstm_model': lstm_model,
-        'gru_model': gru_model,
-        'xgb_model': xgb_model,
-        'scaler_X': scaler_X,
-        'scaler_y': scaler_y,
-        'metadata': metadata
-    }
-
-
-# === 현재 시점 데이터 준비 함수 ===
-def prepare_current_data(data_path, current_datetime, models_dict, hours_needed=96):
-    """
-    현재 시점까지의 데이터를 준비
-    
-    Args:
-        data_path: 학습 데이터 경로
-        current_datetime: 현재 시점 (datetime 객체)
-        models_dict: 로드된 모델 딕셔너리
-        hours_needed: 필요한 데이터 시간 수 (72시간 예측 + 시퀀스 길이)
-    
-    Returns:
-        DataFrame: 현재 시점까지의 데이터
-    """
     print(f"\n{'='*80}")
-    print(f"📊 현재 시점 데이터 준비 중... (기준: {current_datetime.strftime('%Y-%m-%d %H:%M')})")
+    print(f" 제주 사전학습 모델 로드 완료!")
     print(f"{'='*80}")
     
-    feature_cols = models_dict['metadata']['feature_columns']
+    return lstm_model, gru_model, metadata
+
+
+# === 전이학습 함수 ===
+def transfer_learning(model, train_loader, val_loader, criterion, 
+                     num_epochs=50, patience=10, learning_rate=0.0001, 
+                     freeze_layers=False, device='cpu', model_name='Model'):
+    """
+    전이학습 (Fine-tuning)
+    """
+    print(f"\n{'='*80}")
+    print(f"{model_name} 전이학습 시작")
+    print(f"{'='*80}")
+    print(f"학습률: {learning_rate}")
+    print(f"레이어 동결: {freeze_layers}")
     
-    if os.path.exists(data_path):
-        print(f"✅ 데이터 파일 발견: {data_path}")
-        df = pd.read_csv(data_path)
-        
-        # datetime 컬럼 확인 및 변환
-        datetime_col = None
-        for col in ['datetime', 'Datetime', 'date', 'Date', '시간', '일시']:
-            if col in df.columns:
-                datetime_col = col
-                break
-        
-        if datetime_col:
-            df['datetime'] = pd.to_datetime(df[datetime_col])
-        else:
-            # datetime 컬럼이 없으면 첫 번째 열을 시간으로 추정
-            df['datetime'] = pd.to_datetime(df.iloc[:, 0])
-        
-        # 현재 시점 이전 데이터만 필터링
-        df_filtered = df[df['datetime'] <= current_datetime].copy()
-        
-        if len(df_filtered) == 0:
-            print(f"⚠️ 현재 시점({current_datetime}) 이전 데이터가 없습니다.")
-            print(f"데이터 범위: {df['datetime'].min()} ~ {df['datetime'].max()}")
-            print("가장 최근 데이터를 사용합니다.")
-            df_filtered = df.tail(hours_needed).copy()
-        else:
-            # 마지막 N시간 데이터 사용
-            df_filtered = df_filtered.tail(hours_needed).copy()
-        
-        print(f"  • 사용 데이터 기간: {df_filtered['datetime'].min()} ~ {df_filtered['datetime'].max()}")
-        print(f"  • 데이터 포인트: {len(df_filtered)}시간")
-        
-        # 필요한 특성 컬럼만 추출
-        available_features = [col for col in feature_cols if col in df_filtered.columns]
-        missing_features = [col for col in feature_cols if col not in df_filtered.columns]
-        
-        if missing_features:
-            print(f"  ⚠️ 누락된 특성: {missing_features}")
-            print(f"  → 더미 데이터로 대체합니다.")
-        
-        # 필요한 특성 데이터 준비
-        current_data = df_filtered[['datetime']].copy()
-        for col in feature_cols:
-            if col in available_features:
-                current_data[col] = df_filtered[col].values
-            else:
-                # 누락된 특성은 0으로 채움
-                current_data[col] = 0.0
-        
+    # 레이어 동결 옵션
+    if freeze_layers:
+        # LSTM/GRU 레이어는 동결하고 FC 레이어만 학습
+        for param in model.parameters():
+            param.requires_grad = False
+        for param in model.fc.parameters():
+            param.requires_grad = True
+        print("  순환 레이어 동결, FC 레이어만 학습")
     else:
-        print(f"⚠️ 데이터 파일을 찾을 수 없습니다: {data_path}")
-        print("더미 데이터를 생성합니다...")
-        
-        # 더미 데이터 생성
-        end_time = current_datetime
-        start_time = end_time - timedelta(hours=hours_needed-1)
-        
-        datetime_range = pd.date_range(start=start_time, end=end_time, freq='H')
-        
-        current_data = pd.DataFrame({
-            'datetime': datetime_range
-        })
-        
-        # 랜덤 특성 데이터 생성 (실제 환경에서는 센서 데이터 사용)
-        for col in feature_cols:
-            current_data[col] = np.random.randn(len(datetime_range)) * 0.5 + 0.5
+        # 모든 레이어 학습
+        for param in model.parameters():
+            param.requires_grad = True
+        print(" 전체 레이어 미세조정")
     
-    print(f"✅ 데이터 준비 완료 (shape: {current_data.shape})")
+    optimizer = optim.Adam(filter(lambda p: p.requires_grad, model.parameters()), 
+                          lr=learning_rate)
     
-    return current_data
+    best_val_loss = float('inf')
+    patience_counter = 0
+    train_losses = []
+    val_losses = []
+    
+    start_time = time.time()
+    
+    for epoch in range(num_epochs):
+        # Training
+        model.train()
+        train_loss = 0
+        for X_batch, y_batch in train_loader:
+            X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+            
+            optimizer.zero_grad()
+            outputs = model(X_batch)
+            loss = criterion(outputs, y_batch)
+            loss.backward()
+            optimizer.step()
+            
+            train_loss += loss.item()
+        
+        avg_train_loss = train_loss / len(train_loader)
+        train_losses.append(avg_train_loss)
+        
+        # Validation
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for X_batch, y_batch in val_loader:
+                X_batch, y_batch = X_batch.to(device), y_batch.to(device)
+                outputs = model(X_batch)
+                loss = criterion(outputs, y_batch)
+                val_loss += loss.item()
+        
+        avg_val_loss = val_loss / len(val_loader)
+        val_losses.append(avg_val_loss)
+        
+        if (epoch + 1) % 10 == 0:
+            print(f"Epoch [{epoch+1}/{num_epochs}] "
+                  f"Train Loss: {avg_train_loss:.4f} | "
+                  f"Val Loss: {avg_val_loss:.4f}")
+        
+        # Early Stopping
+        if avg_val_loss < best_val_loss:
+            best_val_loss = avg_val_loss
+            patience_counter = 0
+            best_model_state = model.state_dict().copy()
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print(f"\nEarly stopping at epoch {epoch+1}")
+                break
+    
+    model.load_state_dict(best_model_state)
+    
+    elapsed_time = time.time() - start_time
+    print(f"{model_name} 전이학습 완료! 소요 시간: {elapsed_time:.2f}초")
+    
+    return model, train_losses, val_losses
 
 
 # === 예측 함수 ===
-def predict_solar_generation(new_data, models_dict, sequence_length=24):
-    """새로운 데이터에 대해 태양광 발전량 예측"""
-    # 모델과 스케일러 추출
-    lstm_model = models_dict['lstm_model']
-    gru_model = models_dict['gru_model']
-    xgb_model = models_dict['xgb_model']
-    scaler_X = models_dict['scaler_X']
-    scaler_y = models_dict['scaler_y']
-    metadata = models_dict['metadata']
+def predict(model, test_loader, device='cpu'):
+    model.eval()
+    predictions = []
+    actuals = []
     
-    # 특성 컬럼 정보
-    feature_cols = metadata['feature_columns']
-    expected_features = len(feature_cols)
+    with torch.no_grad():
+        for X_batch, y_batch in test_loader:
+            X_batch = X_batch.to(device)
+            outputs = model(X_batch)
+            predictions.extend(outputs.cpu().numpy())
+            actuals.extend(y_batch.numpy())
     
-    # 데이터 형식 변환 및 특성 순서 보장
-    if isinstance(new_data, pd.DataFrame):
-        try:
-            new_data_array = new_data[feature_cols].values
-        except KeyError as e:
-            missing_cols = set(feature_cols) - set(new_data.columns)
-            raise ValueError(f"필수 특성 컬럼이 없습니다: {missing_cols}")
+    return np.array(predictions), np.array(actuals)
+
+
+# === 미래 예측 함수 ===
+def predict_future(model, scaler_X, scaler_y, last_sequence, 
+                   target_datetime, solar_capacity, device='cpu'):
+    """
+    특정 시간의 발전량 예측
+    """
+    model.eval()
+    
+    # 기상 데이터 생성 (대구 기준)
+    month = target_datetime.month
+    hour = target_datetime.hour
+    
+    # 계절별 기상 패턴
+    if month in [11, 12, 1, 2]:
+        base_temp = 5
+        base_humidity = 60
+        base_cloud = 5
+    elif month in [3, 4, 5]:
+        base_temp = 15
+        base_humidity = 55
+        base_cloud = 4
+    elif month in [6, 7, 8]:
+        base_temp = 25
+        base_humidity = 70
+        base_cloud = 6
     else:
-        new_data_array = new_data
-        if new_data_array.shape[1] != expected_features:
-            raise ValueError(
-                f"입력 데이터의 특성 개수({new_data_array.shape[1]})가 "
-                f"예상과 다릅니다(예상: {expected_features})"
-            )
+        base_temp = 15
+        base_humidity = 65
+        base_cloud = 5
     
-    # 데이터가 시퀀스 길이보다 작으면 에러
-    if len(new_data_array) < sequence_length:
-        raise ValueError(f"데이터 길이({len(new_data_array)})가 시퀀스 길이({sequence_length})보다 작습니다.")
+    # 시간대별 온도 조정
+    if 6 <= hour <= 12:
+        temperature = base_temp + (hour - 6) * 1.5
+    elif 12 < hour <= 18:
+        temperature = base_temp + 9 - (hour - 12) * 1.0
+    else:
+        temperature = base_temp - 3
     
-    # 결측값 처리
-    new_data_imputed = new_data_array.copy()
-    for col_idx in range(new_data_imputed.shape[1]):
-        col_data = new_data_imputed[:, col_idx]
-        nan_count = np.sum(np.isnan(col_data))
-        
-        if nan_count > 0:
-            if np.all(np.isnan(col_data)):
-                new_data_imputed[:, col_idx] = 0
-            else:
-                col_mean = np.nanmean(col_data)
-                new_data_imputed[:, col_idx] = np.where(
-                    np.isnan(col_data), 
-                    col_mean, 
-                    col_data
-                )
+    # 일조시간 및 일사량
+    if 6 <= hour <= 18:
+        sunshine_duration = 0.8 if 9 <= hour <= 15 else 0.3
+        solar_radiation = 600 if 9 <= hour <= 15 else 200
+    else:
+        sunshine_duration = 0
+        solar_radiation = 0
     
-    # 데이터 스케일링
-    new_data_scaled = scaler_X.transform(new_data_imputed)
+    # ⭐ 제주 모델과 동일한 8개 특성만 생성
+    # feature_cols = ['temperature', 'precipitation', 'humidity', 'cloud_cover',
+    #                 'sunshine_duration', 'solar_radiation', 'solar_capacity', 'hour']
+    new_features = np.array([[
+        temperature,           # temperature
+        0,                     # precipitation
+        base_humidity,         # humidity
+        base_cloud,            # cloud_cover
+        sunshine_duration,     # sunshine_duration
+        solar_radiation,       # solar_radiation
+        solar_capacity,        # solar_capacity
+        hour                   # hour
+    ]])
     
-    # 시퀀스 데이터 생성
-    X_sequences = []
-    for i in range(len(new_data_scaled) - sequence_length + 1):
-        X_sequences.append(new_data_scaled[i:i+sequence_length])
+    # 스케일링
+    new_features_scaled = scaler_X.transform(new_features)
     
-    X_sequences = np.array(X_sequences)
+    # 시퀀스 업데이트
+    new_sequence = np.vstack([last_sequence[1:], new_features_scaled])
+    new_sequence_tensor = torch.FloatTensor(new_sequence).unsqueeze(0).to(device)
     
-    # PyTorch 텐서로 변환
-    X_tensor = torch.FloatTensor(X_sequences).to(device)
-    
-    # LSTM 예측
-    lstm_model.eval()
+    # 예측
     with torch.no_grad():
-        lstm_predictions_scaled = lstm_model(X_tensor).cpu().numpy()
+        prediction_scaled = model(new_sequence_tensor).cpu().numpy()
+        prediction = scaler_y.inverse_transform(prediction_scaled)[0, 0]
     
-    lstm_predictions = scaler_y.inverse_transform(lstm_predictions_scaled)
-    
-    # GRU 예측
-    gru_model.eval()
-    with torch.no_grad():
-        gru_predictions_scaled = gru_model(X_tensor).cpu().numpy()
-    
-    gru_predictions = scaler_y.inverse_transform(gru_predictions_scaled)
-    
-    # 스태킹 모델용 특성 생성
-    X_stacked = np.hstack([
-        lstm_predictions.reshape(-1, 1),
-        gru_predictions.reshape(-1, 1)
-    ])
-    
-    # XGBoost 스태킹 예측
-    stacked_predictions = xgb_model.predict(X_stacked).reshape(-1, 1)
-    
-    return {
-        'stacked_predictions': stacked_predictions.flatten(),
-        'n_predictions': len(stacked_predictions)
-    }
+    return max(0, prediction), new_sequence
 
-
-# === 현재 시점 예측 함수 ===
-def predict_current_hour(current_data, models_dict, current_datetime, sequence_length=24):
-    """
-    현재 시점의 태양광 발전량 예측
-    
-    Args:
-        current_data: 현재 시점까지의 데이터
-        models_dict: 로드된 모델 딕셔너리
-        current_datetime: 현재 시점
-        sequence_length: 시퀀스 길이
-    
-    Returns:
-        dict: 현재 시점 예측 결과
-    """
-    print(f"\n{'='*80}")
-    print(f"⚡ 현재 시점 예측 중... ({current_datetime.strftime('%Y-%m-%d %H:%M')})")
-    print(f"{'='*80}")
-    
-    # 마지막 sequence_length 데이터를 사용하여 현재 시점 예측
-    if len(current_data) < sequence_length:
-        raise ValueError(f"최소 {sequence_length}시간의 데이터가 필요합니다.")
-    
-    predictions = predict_solar_generation(
-        new_data=current_data.tail(sequence_length + 1),
-        models_dict=models_dict,
-        sequence_length=sequence_length
-    )
-    
-    # 가장 마지막 예측값이 현재 시점의 예측
-    current_prediction = {
-        'datetime': current_datetime,
-        'stacked': float(predictions['stacked_predictions'][-1])
-    }
-    
-    print(f"\n📊 현재 시점 예측 결과:")
-    print(f"  • 예측 발전량: {current_prediction['stacked']:.2f} MWh")
-    
-    return current_prediction
-
-
-# === N시간 이후 예측 함수 ===
-def predict_n_hours_ahead(current_data, models_dict, hours_ahead=24, sequence_length=24):
-    """N시간 이후의 태양광 발전량 예측"""
-    print(f"\n{'='*80}")
-    print(f"🔮 {hours_ahead}시간 이후 예측 수행 중...")
-    print(f"{'='*80}")
-    
-    required_length = sequence_length + hours_ahead
-    if len(current_data) < required_length:
-        raise ValueError(f"최소 {required_length}시간의 데이터가 필요합니다. (현재: {len(current_data)}시간)")
-    
-    # 가장 최근 데이터를 사용하여 예측
-    predictions = predict_solar_generation(
-        new_data=current_data.tail(required_length),
-        models_dict=models_dict,
-        sequence_length=sequence_length
-    )
-    
-    # 마지막 N개 예측값 추출 (N시간 후 예측)
-    future_predictions = {
-        'stacked': predictions['stacked_predictions'][-hours_ahead:],
-        'hours_ahead': hours_ahead
-    }
-    
-    print(f"✅ {hours_ahead}시간 이후 예측 완료 ({len(future_predictions['stacked'])}시간)")
-    
-    return future_predictions
-
-
-# === 다중 시간대 예측 및 저장 ===
-def predict_multiple_horizons_realtime(current_data, models_dict, current_datetime, 
-                                       output_dir='./prediction_results', sequence_length=24):
-    """
-    현재 시점 + 24H, 48H, 72H 이후의 태양광 발전량 예측 및 CSV 파일로 저장
-    """
-    print(f"\n{'='*80}")
-    print(f"📊 실시간 다중 시간대 예측 시스템 시작")
-    print(f"   기준 시각: {current_datetime.strftime('%Y년 %m월 %d일 %H시')}")
-    print(f"{'='*80}")
-    
-    # 출력 디렉토리 생성
-    os.makedirs(output_dir, exist_ok=True)
-    
-    results = {}
-    
-    # 1. 현재 시점 예측
-    print(f"\n{'─'*80}")
-    print(f"⚡ 현재 시점 예측")
-    print(f"{'─'*80}")
-    
-    current_pred = predict_current_hour(current_data, models_dict, current_datetime, sequence_length)
-    
-    # 현재 시점 결과 저장
-    current_df = pd.DataFrame([{
-        '예측일시': current_datetime,
-        '예측시간': '현재',
-        '예측발전량(MWh)': current_pred['stacked']
-    }])
-    
-    current_csv = os.path.join(output_dir, 'prediction_current.csv')
-    current_df.to_csv(current_csv, index=False, encoding='utf-8-sig')
-    print(f"  💾 현재 시점 예측 저장: {current_csv}")
-    
-    results['current'] = {
-        'dataframe': current_df,
-        'csv_path': current_csv,
-        'prediction': current_pred
-    }
-    
-    # 2. 24H, 48H, 72H 예측 수행
-    for hours in [24, 48, 72]:
-        print(f"\n{'─'*80}")
-        print(f"🔮 {hours}시간 후 예측 수행")
-        print(f"{'─'*80}")
-        
-        try:
-            # 예측 수행
-            predictions = predict_n_hours_ahead(
-                current_data=current_data,
-                models_dict=models,
-                hours_ahead=hours,
-                sequence_length=sequence_length
-            )
-            
-            # 시간 정보 생성
-            time_labels = []
-            datetime_labels = []
-            for i in range(hours):
-                time_labels.append(f'+{i+1}시간')
-                datetime_labels.append(current_datetime + timedelta(hours=i+1))
-            
-            # DataFrame 생성
-            df = pd.DataFrame({
-                '예측시간': time_labels,
-                '예측일시': datetime_labels,
-                '예측발전량(MWh)': predictions['stacked']
-            })
-            
-            # 누적 발전량 계산
-            df['누적발전량(MWh)'] = df['예측발전량(MWh)'].cumsum()
-            
-            # CSV 파일로 저장
-            csv_filename = f'prediction_{hours}H_{current_datetime.strftime("%Y%m%d_%H%M")}.csv'
-            csv_path = os.path.join(output_dir, csv_filename)
-            df.to_csv(csv_path, index=False, encoding='utf-8-sig')
-            
-            print(f"  ✅ {hours}시간 예측 완료")
-            print(f"  💾 파일 저장: {csv_path}")
-            print(f"  📈 총 예측 발전량: {predictions['stacked'].sum():.2f} MWh")
-            print(f"  📊 시간당 평균: {predictions['stacked'].mean():.2f} MWh")
-            
-            # 결과 저장
-            results[f'{hours}H'] = {
-                'dataframe': df,
-                'csv_path': csv_path,
-                'summary': {
-                    'total': float(predictions['stacked'].sum()),
-                    'mean': float(predictions['stacked'].mean()),
-                    'max': float(predictions['stacked'].max()),
-                    'min': float(predictions['stacked'].min())
-                }
-            }
-            
-        except Exception as e:
-            print(f"  ❌ {hours}시간 예측 실패: {e}")
-            results[f'{hours}H'] = None
-    
-    # 3. 통합 요약 리포트 생성
-    print(f"\n{'='*80}")
-    print("📋 통합 예측 요약 리포트 생성")
-    print(f"{'='*80}")
-    
-    summary_data = [{
-        '예측구간': '현재',
-        '예측발전량(MWh)': current_pred['stacked'],
-        '누적발전량(MWh)': current_pred['stacked']
-    }]
-    
-    for hours in [24, 48, 72]:
-        if results[f'{hours}H'] is not None:
-            summary = results[f'{hours}H']['summary']
-            summary_data.append({
-                '예측구간': f'{hours}시간',
-                '예측발전량(MWh)': summary['total'],
-                '누적발전량(MWh)': summary['total']
-            })
-    
-    summary_df = pd.DataFrame(summary_data)
-    summary_path = os.path.join(output_dir, f'prediction_summary_{current_datetime.strftime("%Y%m%d_%H%M")}.csv')
-    summary_df.to_csv(summary_path, index=False, encoding='utf-8-sig')
-    
-    print(f"  💾 통합 요약 저장: {summary_path}")
-    
-    # 콘솔 출력
-    print(f"\n{'='*80}")
-    print("📊 최종 예측 결과 요약")
-    print(f"{'='*80}")
-    print(summary_df.to_string(index=False))
-    
-    print(f"\n{'='*80}")
-    print(f"✨ 모든 예측 결과가 '{output_dir}' 디렉토리에 저장되었습니다!")
-    print(f"{'='*80}")
-    print(f"\n저장된 파일:")
-    print(f"  📄 {current_csv}")
-    for hours in [24, 48, 72]:
-        if results[f'{hours}H'] is not None:
-            print(f"  📄 {results[f'{hours}H']['csv_path']}")
-    print(f"  📄 {summary_path}")
-    
-    return results
-
-
-# === 메인 실행 함수 ===
+# === 메인 실행 ===
 if __name__ == "__main__":
     try:
-	 
-        start = time.time() # 시작
+        # 1. 제주 사전학습 모델 로드
+        lstm_pretrained, gru_pretrained, jeju_metadata = load_jeju_pretrained_models(
+            model_dir=model_dir
+        )
         
-        # 현재 날짜 및 시간 자동 설정 (2025년 11월 10일)
-        CURRENT_DATETIME = datetime(2025, 11, 10, datetime.now().hour)
+        print(f"\n제주 모델 성능:")
+        print(f"  LSTM R²: {jeju_metadata['lstm_metrics']['r2']:.4f}")
+        print(f"  GRU R²: {jeju_metadata['gru_metrics']['r2']:.4f}")
+        print(f"  Stacking R²: {jeju_metadata['stacked_metrics']['r2']:.4f}")
         
+        # 2. 대구 데이터 로딩
+        SEQUENCE_LENGTH = 24
+        daegu_csv_path = "./dataset/대구.csv"  
+        
+        (X_train, X_val, X_test, y_train, y_val, y_test,
+         scaler_X, scaler_y, feature_cols, df_valid, date_test) = load_daegu_data(
+            daegu_csv_path, SEQUENCE_LENGTH
+        )
+        
+        # 3. DataLoader 생성
+        BATCH_SIZE = 32
+        train_dataset = TimeSeriesDataset(X_train, y_train)
+        val_dataset = TimeSeriesDataset(X_val, y_val)
+        test_dataset = TimeSeriesDataset(X_test, y_test)
+        
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+        
+        if device.type == 'cuda':
+            # 4. LSTM 전이학습
+            print("\n" + "="*80)
+            print("LSTM 전이학습 (대구)")
+            print("="*80)
+            
+            criterion = nn.MSELoss()
+            lstm_model, lstm_train_losses, lstm_val_losses = transfer_learning(
+                lstm_pretrained, train_loader, val_loader, criterion,
+                num_epochs=50, patience=10, learning_rate=0.0001,
+                freeze_layers=False, device=device, model_name='LSTM'
+            )
+            
+            # 5. GRU 전이학습
+            print("\n" + "="*80)
+            print("GRU 전이학습 (대구)")
+            print("="*80)
+            
+            gru_model, gru_train_losses, gru_val_losses = transfer_learning(
+                gru_pretrained, train_loader, val_loader, criterion,
+                num_epochs=50, patience=10, learning_rate=0.0001,
+                freeze_layers=False, device=device, model_name='GRU'
+            )
+        else:
+            lstm_model = lstm_pretrained
+            gru_model = gru_pretrained
+            print("\n CPU 환경에서는 전이학습을 건너뜁니다.")
+        
+        # 6. 미래 발전량 예측 (24H, 48H, 72H)
         print("\n" + "="*80)
-        print("🚀 실시간 태양광 발전량 예측 시스템")
-        print(f"   📅 기준 시각: {CURRENT_DATETIME.strftime('%Y년 %m월 %d일 %H시')}")
+        print("미래 발전량 예측 (대구) - 전이학습 모델 사용")
         print("="*80)
         
-        # 1. 저장된 모델 로드
-        models = load_trained_models(model_dir='./saved_models')
+        solar_capacity = df_valid['solar_capacity'].iloc[0]
+        current_time = datetime.now()  # 실제 현재 시각 사용
+        last_sequence = X_test[-1]  # 마지막 시퀀스 사용
         
-        # 2. 현재 시점까지의 데이터 준비
-        data_path = "./dataset/jeju_solar_utf8.csv"
+        print(f"\n 현재 시각: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f" 설비용량: {solar_capacity:.2f} MW")
+        print(f"\n전이학습된 LSTM + GRU 모델을 사용하여 미래 발전량을 예측합니다.")
         
-        current_data = prepare_current_data(
-            data_path=data_path,
-            current_datetime=CURRENT_DATETIME,
-            models_dict=models,
-            hours_needed=96  # 72시간 예측 + 24시간 시퀀스
-        )
+        # 24H, 48H, 72H 후 예측
+        for hours_ahead in [24, 48, 72]:
+            target_date = current_time + timedelta(hours=hours_ahead)
+            print(f"\n{'='*70}")
+            print(f" {hours_ahead}시간 후 예측: {target_date.strftime('%Y-%m-%d %A')}")
+            print(f"{'='*70}")
+            
+            daily_predictions_lstm = []
+            daily_predictions_gru = []
+            daily_predictions_ensemble = []
+            temp_sequence = last_sequence.copy()
+            hourly_details = []
+            
+            for h in range(24):
+                target_time = current_time + timedelta(hours=hours_ahead+h)
+                
+                # LSTM 예측
+                lstm_pred, temp_sequence = predict_future(
+                    lstm_model, scaler_X, scaler_y, temp_sequence,
+                    target_time, solar_capacity, device
+                )
+                
+                # GRU 예측
+                gru_pred, _ = predict_future(
+                    gru_model, scaler_X, scaler_y, temp_sequence,
+                    target_time, solar_capacity, device
+                )
+                
+                # 앙상블 (LSTM + GRU 평균)
+                ensemble_pred = (lstm_pred + gru_pred) / 2
+                
+                daily_predictions_lstm.append(max(0, lstm_pred))
+                daily_predictions_gru.append(max(0, gru_pred))
+                daily_predictions_ensemble.append(max(0, ensemble_pred))
+                
+                # 시간별 상세 정보 저장
+                hourly_details.append({
+                    'time': target_time.strftime('%H:%M'),
+                    'lstm': lstm_pred,
+                    'gru': gru_pred,
+                    'ensemble': ensemble_pred
+                })
+            
+            # 일일 통계 계산
+            total_lstm = sum(daily_predictions_lstm)
+            total_gru = sum(daily_predictions_gru)
+            total_ensemble = sum(daily_predictions_ensemble)
+            
+            peak_lstm = max(daily_predictions_lstm)
+            peak_gru = max(daily_predictions_gru)
+            peak_ensemble = max(daily_predictions_ensemble)
+            
+            # 결과 출력
+            print(f"\n[LSTM 모델 예측]")
+            print(f"  일일 총 발전량: {total_lstm:.2f} MWh")
+            print(f"  피크 발전량: {peak_lstm:.2f} MWh (시간당)")
+            print(f"  평균 시간당: {total_lstm/24:.2f} MWh")
+            print(f"  평균 가동률: {(total_lstm/(solar_capacity*24))*100:.1f}%")
+            
+            print(f"\n[GRU 모델 예측]")
+            print(f"  일일 총 발전량: {total_gru:.2f} MWh")
+            print(f"  피크 발전량: {peak_gru:.2f} MWh (시간당)")
+            print(f"  평균 시간당: {total_gru/24:.2f} MWh")
+            print(f"  평균 가동률: {(total_gru/(solar_capacity*24))*100:.1f}%")
+            
+            print(f"\n[앙상블 예측 (LSTM+GRU 평균)] 권장")
+            print(f"  일일 총 발전량: {total_ensemble:.2f} MWh")
+            print(f"  피크 발전량: {peak_ensemble:.2f} MWh (시간당)")
+            print(f"  평균 시간당: {total_ensemble/24:.2f} MWh")
+            print(f"  평균 가동률: {(total_ensemble/(solar_capacity*24))*100:.1f}%")
+            
+            # 시간별 상세 예측 (주요 발전 시간대만 출력)
+            print(f"\n 시간별 발전량 상세 (앙상블 기준, 발전량 > 0.5 MWh):")
+            print("-" * 60)
+            for detail in hourly_details:
+                if detail['ensemble'] > 0.5:
+                    print(f"  {detail['time']} - {detail['ensemble']:6.2f} MWh "
+                          f"(LSTM: {detail['lstm']:5.2f}, GRU: {detail['gru']:5.2f})")
         
-        # 3. 현재 시점 + 24H/48H/72H 예측 수행 및 저장
-        results = predict_multiple_horizons_realtime(
-            current_data=current_data,
-            models_dict=models,
-            current_datetime=CURRENT_DATETIME,
-            output_dir='./prediction_results',
-            sequence_length=24
-        )
-        
-        # 4. 상세 결과 미리보기
+                # 7. 예측 결과를 CSV로 저장
         print(f"\n{'='*80}")
-        print("📋 상세 결과 미리보기")
+        print("예측 결과 CSV 저장 중...")
         print(f"{'='*80}")
         
-        # 현재 시점 결과
-        print(f"\n⚡ 현재 시점 ({CURRENT_DATETIME.strftime('%Y-%m-%d %H:00')}):")
-        print(results['current']['dataframe'].to_string(index=False))
+        # 모든 예측 결과를 담을 리스트
+        all_predictions = []
         
-        # 각 시간대 예측 결과 (처음 5개와 마지막 5개)
-        for hours in [24, 48, 72]:
-            if results[f'{hours}H'] is not None:
-                print(f"\n🔮 {hours}시간 후 예측 (처음 5시간):")
-                print(results[f'{hours}H']['dataframe'].head().to_string(index=False))
-                print(f"\n🔮 {hours}시간 후 예측 (마지막 5시간):")
-                print(results[f'{hours}H']['dataframe'].tail().to_string(index=False))
+        # 다시 예측 수행하며 데이터 수집
+        temp_sequence = X_test[-1].copy()
         
-        print(f"\n{'='*80}")
-        print("✅ 예측 완료!")
-        print(f"{'='*80}")
+        for hours_ahead in [24, 48, 72]:
+            for h in range(24):
+                target_time = current_time + timedelta(hours=hours_ahead+h)
+                
+                # LSTM 예측
+                lstm_pred, temp_sequence = predict_future(
+                    lstm_model, scaler_X, scaler_y, temp_sequence,
+                    target_time, solar_capacity, device
+                )
+                
+                # GRU 예측
+                gru_pred, _ = predict_future(
+                    gru_model, scaler_X, scaler_y, temp_sequence,
+                    target_time, solar_capacity, device
+                )
+                
+                # 앙상블
+                ensemble_pred = (lstm_pred + gru_pred) / 2
+                
+                # 데이터 저장
+                all_predictions.append({
+                    '예측일시': target_time.strftime('%Y-%m-%d %H:%M:%S'),
+                    '날짜': target_time.strftime('%Y-%m-%d'),
+                    '시각': target_time.strftime('%H:%M'),
+                    '요일': target_time.strftime('%A'),
+                    'LSTM_발전량(MWh)': max(0, lstm_pred),
+                    'GRU_발전량(MWh)': max(0, gru_pred),
+                    '앙상블_발전량(MWh)': max(0, ensemble_pred),
+                    '예측_시점': f'{hours_ahead}H',
+                    '설비용량(MW)': solar_capacity
+                })
+        
+        # DataFrame 생성
+        df_predictions = pd.DataFrame(all_predictions)
+        
+        # CSV 저장
+        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+        csv_filename = f'daegu_predictions_{timestamp_str}.csv'
+        csv_path = os.path.join(output_dir, csv_filename)
+        df_predictions.to_csv(csv_path, index=False, encoding='utf-8-sig')
+        
+        print(f"\n CSV 파일 저장 완료: {csv_path}")
+        print(f"   총 {len(df_predictions)}개 시간대 예측 데이터 저장")
 
-        end_time = time.time()-start # 종료 - 시작 (걸린 시간)
-	 
-        times = str(timedelta(seconds=end_time)) # 걸린시간 보기좋게 바꾸기
-        short = times.split(".")[0] # 초 단위 까지만
-        print(f"serving.py 실행 시간 : {times} sec")
+
+        # 7. 최종 요약
+        
+        # 7. 최종 요약
+        print(f"\n{'='*80}")
+        print("대구 전이학습 및 미래 예측 완료!")
+        print(f"{'='*80}")
+        print(f"\n 제주 백본 모델을 로드하여 대구 데이터로 전이학습 완료")
+        print(f" 전이학습된 모델로 24H, 48H, 72H 후 발전량 예측 완료")
+        print(f"\n 참고:")
+        print(f"  - 전이학습된 모델은 별도로 저장하지 않았습니다")
+        print(f"  - LSTM과 GRU의 앙상블 예측을 권장합니다")
+        print(f"  - 실제 기상 조건에 따라 발전량은 달라질 수 있습니다")
         
     except FileNotFoundError as e:
-        print(f"\n❌ 오류: {e}")
-        print("먼저 모델을 학습하고 저장해야 합니다.")
+        print(f"Error: 파일을 찾을 수 없습니다. {e}")
+        print("\n확인 사항:")
+        print("1. 제주 사전학습 모델이 ./saved_models 디렉토리에 있는지 확인")
+        print("2. 대구 CSV 파일 경로가 올바른지 확인")
     except Exception as e:
-        print(f"\n❌ 오류 발생: {e}")
+        print(f"Error: {e}")
+        import traceback
+        traceback.print_exc()
+
+
+def predict_future():
+    try:
+        # 1. 제주 사전학습 모델 로드
+        lstm_pretrained, gru_pretrained, jeju_metadata = load_jeju_pretrained_models(
+            model_dir=model_dir
+        )
+        
+        print(f"\n제주 모델 성능:")
+        print(f"  LSTM R²: {jeju_metadata['lstm_metrics']['r2']:.4f}")
+        print(f"  GRU R²: {jeju_metadata['gru_metrics']['r2']:.4f}")
+        print(f"  Stacking R²: {jeju_metadata['stacked_metrics']['r2']:.4f}")
+        
+        # 2. 대구 데이터 로딩
+        SEQUENCE_LENGTH = 24
+        daegu_csv_path = "./dataset/대구.csv"  
+        
+        (X_train, X_val, X_test, y_train, y_val, y_test,
+         scaler_X, scaler_y, feature_cols, df_valid, date_test) = load_daegu_data(
+            daegu_csv_path, SEQUENCE_LENGTH
+        )
+        
+        # 3. DataLoader 생성
+        BATCH_SIZE = 32
+        train_dataset = TimeSeriesDataset(X_train, y_train)
+        val_dataset = TimeSeriesDataset(X_val, y_val)
+        test_dataset = TimeSeriesDataset(X_test, y_test)
+        
+        train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+        val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+        test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE)
+        
+        if device.type == 'cuda':
+            # 4. LSTM 전이학습
+            print("\n" + "="*80)
+            print("LSTM 전이학습 (대구)")
+            print("="*80)
+            
+            criterion = nn.MSELoss()
+            lstm_model, lstm_train_losses, lstm_val_losses = transfer_learning(
+                lstm_pretrained, train_loader, val_loader, criterion,
+                num_epochs=50, patience=10, learning_rate=0.0001,
+                freeze_layers=False, device=device, model_name='LSTM'
+            )
+            
+            # 5. GRU 전이학습
+            print("\n" + "="*80)
+            print("GRU 전이학습 (대구)")
+            print("="*80)
+            
+            gru_model, gru_train_losses, gru_val_losses = transfer_learning(
+                gru_pretrained, train_loader, val_loader, criterion,
+                num_epochs=50, patience=10, learning_rate=0.0001,
+                freeze_layers=False, device=device, model_name='GRU'
+            )
+        else:
+            lstm_model = lstm_pretrained
+            gru_model = gru_pretrained
+            print("\n CPU 환경에서는 전이학습을 건너뜁니다.")
+        
+        # 6. 미래 발전량 예측 (24H, 48H, 72H)
+        print("\n" + "="*80)
+        print("미래 발전량 예측 (대구) - 전이학습 모델 사용")
+        print("="*80)
+        
+        solar_capacity = df_valid['solar_capacity'].iloc[0]
+        current_time = datetime.now()  # 실제 현재 시각 사용
+        last_sequence = X_test[-1]  # 마지막 시퀀스 사용
+        
+        print(f"\n 현재 시각: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print(f" 설비용량: {solar_capacity:.2f} MW")
+        print(f"\n전이학습된 LSTM + GRU 모델을 사용하여 미래 발전량을 예측합니다.")
+        
+        # 24H, 48H, 72H 후 예측
+        for hours_ahead in [24, 48, 72]:
+            target_date = current_time + timedelta(hours=hours_ahead)
+            print(f"\n{'='*70}")
+            print(f" {hours_ahead}시간 후 예측: {target_date.strftime('%Y-%m-%d %A')}")
+            print(f"{'='*70}")
+            
+            daily_predictions_lstm = []
+            daily_predictions_gru = []
+            daily_predictions_ensemble = []
+            temp_sequence = last_sequence.copy()
+            hourly_details = []
+            
+            for h in range(24):
+                target_time = current_time + timedelta(hours=hours_ahead+h)
+                
+                # LSTM 예측
+                lstm_pred, temp_sequence = predict_future(
+                    lstm_model, scaler_X, scaler_y, temp_sequence,
+                    target_time, solar_capacity, device
+                )
+                
+                # GRU 예측
+                gru_pred, _ = predict_future(
+                    gru_model, scaler_X, scaler_y, temp_sequence,
+                    target_time, solar_capacity, device
+                )
+                
+                # 앙상블 (LSTM + GRU 평균)
+                ensemble_pred = (lstm_pred + gru_pred) / 2
+                
+                daily_predictions_lstm.append(max(0, lstm_pred))
+                daily_predictions_gru.append(max(0, gru_pred))
+                daily_predictions_ensemble.append(max(0, ensemble_pred))
+                
+                # 시간별 상세 정보 저장
+                hourly_details.append({
+                    'time': target_time.strftime('%H:%M'),
+                    'lstm': lstm_pred,
+                    'gru': gru_pred,
+                    'ensemble': ensemble_pred
+                })
+
+            return hourly_details  
+
+        
+    except FileNotFoundError as e:
+        print(f"Error: 파일을 찾을 수 없습니다. {e}")
+        print("\n확인 사항:")
+        print("1. 제주 사전학습 모델이 ./saved_models 디렉토리에 있는지 확인")
+        print("2. 대구 CSV 파일 경로가 올바른지 확인")
+    except Exception as e:
+        print(f"Error: {e}")
         import traceback
         traceback.print_exc()

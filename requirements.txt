@@ -4,6 +4,8 @@ numpy
 pandas
 scikit-learn
 xgboost
+matplotlib
+seaborn
 
 # --- DB 연동을 위해 아래 4개 추가 ---
 sqlalchemy     # ORM (필수)
