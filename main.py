@@ -30,8 +30,17 @@ app.add_middleware(
 # --- AI 모델 로드 ---
 # (서버 시작 시 AI 모델을 메모리에 로드)
 try:
-    models_ai = serving.load_trained_models()
-    print("✅ AI 모델 로딩 성공!")
+    models_ai = serving.predict_()
+    '''models_ai 반환값 = {
+                    'time': target_time.strftime('%H:%M'),
+                    'lstm': lstm_pred,
+                    'gru': gru_pred,
+                    'ensemble': ensemble_pred
+                }을 담고 있는 리스트 형태 결국 결론은 ensemble을 사용해야 됨'''
+    for line in models_ai:
+        print(line)
+    print("✅ AI 모델 추론 성공!")
+
 except Exception as e:
     print(f"❌ AI 모델 로딩 실패: {e}")
     models_ai = None
@@ -113,7 +122,7 @@ async def predict(
         features_df = pd.DataFrame(request.features)
         
         # serving.py의 예측 함수 호출
-        ai_result_dict = serving.predict_solar_generation(
+        ai_result_dict = serving.predict_(
             new_data=features_df,
             models_dict=models_ai,
             sequence_length=request.sequence_length
