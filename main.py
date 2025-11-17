@@ -37,8 +37,8 @@ try:
                     'gru': gru_pred,
                     'ensemble': ensemble_pred
                 }을 담고 있는 리스트 형태 결국 결론은 ensemble을 사용해야 됨'''
-    for line in models_ai:
-        print(line)
+    # for line in models_ai:
+    #     print(line)
     print("✅ AI 모델 추론 성공!")
 
 except Exception as e:
@@ -122,17 +122,15 @@ async def predict(
         features_df = pd.DataFrame(request.features)
         
         # serving.py의 예측 함수 호출
-        ai_result_dict = serving.predict_(
-            new_data=features_df,
-            models_dict=models_ai,
-            sequence_length=request.sequence_length
-        )
+        ai_result_dict = serving.predict_()
         # (ai_result_dict의 형식을 serving.py에 맞게 조정 필요)
         
         # (임시) serving.py가 아래 형식으로 반환한다고 가정:
         # ai_result_dict = {
-        #     "stacked_predictions": [120.5, 130.2, ...],
-        #     "metadata": {"model": "XGBoost", "version": "1.2"}
+        #     "time": '12:02',
+        #     "lstm": np.float32(17.581806)
+        #     "gru": np.float32(16.234567),
+        #     "ensemble": np.float32(16.908136)
         # }
         
         # (임시) 프론트엔드/DB 저장용 데이터로 가공
