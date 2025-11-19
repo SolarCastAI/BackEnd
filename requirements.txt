@@ -11,3 +11,4 @@ asyncpg        # PostgreSQL 비동기 드라이버 (권장)
 python-dotenv  # .env 파일로 DB 접속정보 관리
 alembic        # (선택) 백엔드 프로젝트에서도 DB 스키마 관리시
 greenlet
+seaborn

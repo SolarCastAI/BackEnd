@@ -1,52 +1,84 @@
 import math
+import pandas as pd
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from sqlalchemy import func, and_
 from sqlalchemy.dialects.postgresql import insert
 from typing import List, Optional, Dict
 from datetime import datetime, timedelta, date
+import random
 
-# --- 로컬 모듈 임포트 ---
 import models
 import schemas
 
-# (참고) DB 스키마(models.py)와 프론트엔드 요구(schemas.py) 간의 단위 변환
-# - DB: generation_mwh (메가와트시), capacity_mw (메가와트)
-# - API/Frontend: Kwh (킬로와트시), Kw (킬로와트)
-# - 1 MWh = 1000 KWh
-# - 1 MW = 1000 KW
+# ================================================
+# (Q1) AI 예측을 위한 DB 조회 함수
+# ================================================
+async def get_training_data(db: AsyncSession, region_id: int, limit: int = 2000) -> pd.DataFrame:
+    """
+    AI 모델 학습/추론용 데이터를 DB에서 추출하여 DataFrame으로 반환합니다.
+    WeatherTs(기상)와 GenerationTs(발전량)를 시간(ts) 기준으로 조인합니다.
+    serving.py 모델이 사용하는 영문 컬럼명으로 반환합니다.
+    """
+    stmt = select(
+        models.WeatherTs.ts.label('datetime'),           # 발전일자 -> datetime
+        models.WeatherTs.temp_c.label('temperature'),    # 기온
+        models.WeatherTs.precip_mm.label('precipitation'), # 강우량
+        models.WeatherTs.humidity.label('humidity'),     # 습도
+        models.WeatherTs.snow_cm.label('snow'),          # 적설량
+        models.WeatherTs.cloud_10.label('cloud_cover'),  # 전운량
+        models.WeatherTs.sunshine_hr.label('sunshine_duration'), # 일조
+        models.WeatherTs.solar_irr.label('solar_radiation'),     # 일사량
+        models.GenerationTs.capacity_mw.label('solar_capacity'), # 설비용량
+        models.GenerationTs.generation_mwh.label('solar_generation') # 발전량
+    ).join(
+        models.GenerationTs,
+        and_(
+            models.WeatherTs.ts == models.GenerationTs.ts,
+            models.WeatherTs.region_id == models.GenerationTs.region_id
+        )
+    ).where(
+        models.WeatherTs.region_id == region_id
+    ).order_by(
+        models.WeatherTs.ts.asc() # 과거 -> 현재 순서 정렬
+    )
+    
+    if limit > 0:
+        stmt = stmt.limit(limit)
 
+    result = await db.execute(stmt)
+    rows = result.all()
+
+    if not rows:
+        return pd.DataFrame() 
+
+    # DataFrame 변환 (컬럼명 명시)
+    df = pd.DataFrame(rows, columns=[
+        'datetime', 'temperature', 'precipitation', 'humidity', 
+        'snow', 'cloud_cover', 'sunshine_duration', 'solar_radiation', 
+        'solar_capacity', 'solar_generation'
+    ])
+
+    # 데이터 타입 보정
+    df['datetime'] = pd.to_datetime(df['datetime'])
+    
+    return df
+
+
+# ================================================
+# 기존 Dashboard 및 데이터 조회 함수들
+# ================================================
 async def get_dashboard_summary(db: AsyncSession) -> Dict:
-    """
-    대시보드 요약 정보를 DB에서 조회/계산합니다.
-    """
     today = date.today()
-    
-    # 1. 'generation_ts'에서 오늘의 누적 발전량(today_total) 계산
-    # (generation_mwh * 1000 = generation_kwh)
-    today_total_query = select(func.sum(models.GenerationTs.generation_mwh * 1000))\
-        .where(func.date(models.GenerationTs.ts) == today)
-    
+    today_total_query = select(func.sum(models.GenerationTs.generation_mwh * 1000)).where(func.date(models.GenerationTs.ts) == today)
     today_total_result = await db.execute(today_total_query)
     today_total_kwh = today_total_result.scalar_one_or_none() or 0.0
     
-    # 2. 'generation_ts'에서 현재 발전량(current_power) 조회
-    # (가장 최근 'generation_mwh' 값을 '현재 시간의 발전량'으로 간주, Kw로 변환)
-    # (참고: generation_mwh는 1시간 누적값이므로 '현재' 전력(Kw)과 다를 수 있으나,
-    #       스키마 상 가장 근접한 값입니다.)
-    current_power_query = select(models.GenerationTs.generation_mwh * 1000)\
-        .order_by(models.GenerationTs.ts.desc())\
-        .limit(1)
-    
+    current_power_query = select(models.GenerationTs.generation_mwh * 1000).order_by(models.GenerationTs.ts.desc()).limit(1)
     current_power_result = await db.execute(current_power_query)
     current_power_kw = current_power_result.scalar_one_or_none() or 0.0
 
-    # 3. 'eval_daily'에서 정확도(accuracy) 계산
-    # (가장 최근 MAPE 값을 가져와 100에서 뺌)
-    accuracy_query = select(models.EvalDaily.mape)\
-        .order_by(models.EvalDaily.date.desc())\
-        .limit(1)
-    
+    accuracy_query = select(models.EvalDaily.mape).order_by(models.EvalDaily.date.desc()).limit(1)
     accuracy_result = await db.execute(accuracy_query)
     mape = accuracy_result.scalar_one_or_none() or 0.0
     accuracy_percent = max(0.0, 100.0 - mape)
@@ -58,168 +90,78 @@ async def get_dashboard_summary(db: AsyncSession) -> Dict:
     }
 
 async def get_regions_data(db: AsyncSession) -> List[schemas.RegionPowerData]:
-    """
-    모든 지역의 오늘 발전량 합계 및 기타 정보를 조회합니다.
-    """
-    today = date.today()
-    
-    # 'regions' 테이블과 'generation_ts' 테이블을 JOIN하여
-    # 오늘 날짜 기준, 지역별 발전량(Kwh) 합계 조회
     query = select(
         models.Region.name,
         func.sum(models.GenerationTs.generation_mwh * 1000).label("total_power_kwh")
     )\
     .join(models.GenerationTs, models.Region.region_id == models.GenerationTs.region_id)\
     .group_by(models.Region.name)
-    #.where(func.date(models.GenerationTs.ts) == today)\
     
     result = await db.execute(query)
-    db_data = result.all() # (region_name, total_power_kwh) 리스트
+    db_data = result.all()
     
     response_list = []
-    
-    # TODO: 위도(latitude), 경도(longitude)는 'regions' 테이블에 컬럼을 추가하는 것이 좋습니다.
-    # (임시로 Mock 데이터의 위/경도 사용)
     mock_geo_data = {
-        "서울": {"lat": 37.5665, "lng": 126.9780},
-        "부산": {"lat": 35.1796, "lng": 129.0756},
-        "대구": {"lat": 35.8714, "lng": 128.6014},
-        "인천": {"lat": 37.4563, "lng": 126.7052},
-        "대전": {"lat": 36.3504, "lng": 127.3845},
-        "제주": {"lat": 33.4996, "lng": 126.5312} # 스키마 기본값
+        "서울": {"lat": 37.5665, "lng": 126.9780}, "부산": {"lat": 35.1796, "lng": 129.0756},
+        "대구": {"lat": 35.8714, "lng": 128.6014}, "인천": {"lat": 37.4563, "lng": 126.7052},
+        "대전": {"lat": 36.3504, "lng": 127.3845}, "제주": {"lat": 33.4996, "lng": 126.5312}
     }
 
     for name, total_power_kwh in db_data:
-        geo = mock_geo_data.get(name, {"lat": 37.0, "lng": 127.5}) # 기본값
-        # --- 수정된 부분 ---
-        # total_power_kwh가 None이거나 NaN(숫자 아님)인지 확인
+        geo = mock_geo_data.get(name, {"lat": 37.0, "lng": 127.5})
         if total_power_kwh is None or math.isnan(total_power_kwh):
             power_kwh = 0.0
         else:
             power_kwh = round(total_power_kwh, 0)
-        # --- 여기까지 ---
-        
-        # TODO: 수익(revenue) 계산 로직 (예: kWh당 단가)은 비즈니스 로직에 맞게 수정 필요
-        revenue = int(power_kwh * 174) # (임시 단가 174원/kWh)
-        
+        revenue = int(power_kwh * 174)
         response_list.append(schemas.RegionPowerData(
-            region=name,
-            power=power_kwh,
-            revenue=revenue,
-            latitude=geo["lat"],
-            longitude=geo["lng"]
+            region=name, power=power_kwh, revenue=revenue,
+            latitude=geo["lat"], longitude=geo["lng"]
         ))
-        
     return response_list
 
-async def get_region_data(db: AsyncSession, region_name: str) -> Optional[schemas.RegionPowerData]:
-    """
-    특정 지역의 오늘 발전량 합계 및 기타 정보를 조회합니다.
-    """
-    today = date.today()
-    
-    query = select(
-        models.Region.name,
-        func.sum(models.GenerationTs.generation_mwh * 1000).label("total_power_kwh")
-    )\
-    .join(models.GenerationTs, models.Region.region_id == models.GenerationTs.region_id)\
-    .where(
-        and_(
-            func.date(models.GenerationTs.ts) == today,
-            models.Region.name == region_name
-        )
-    )\
-    .group_by(models.Region.name)
-    
-    result = await db.execute(query)
-    db_data = result.first() # (region_name, total_power_kwh)
-    
-    if not db_data:
-        return None
-    
-    # (get_regions_data와 동일한 임시/TODO 로직 사용)
-    mock_geo_data = {"제주": {"lat": 33.4996, "lng": 126.5312}} # (간략화)
-    geo = mock_geo_data.get(db_data[0], {"lat": 37.0, "lng": 127.5})
-    power_kwh = round(db_data[1] or 0.0, 0)
-    revenue = int(power_kwh * 174)
-    
-    return schemas.RegionPowerData(
-        region=db_data[0],
-        power=power_kwh,
-        revenue=revenue,
-        latitude=geo["lat"],
-        longitude=geo["lng"]
-    )
-
 async def get_power_forecast(db: AsyncSession, hours: int) -> List[schemas.PowerForecast]:
-    """
-    시간대별 실제/예측 발전량 데이터를 조회합니다.
-    """
     now = datetime.now()
-    # 쿼리 기준 시간 (현재 시간의 정각)
     start_time = now.replace(minute=0, second=0, microsecond=0)
-    end_time = start_time + timedelta(hours=hours)
-    
-    # TODO: API가 특정 지역을 지정할 수 있도록 수정해야 합니다.
-    # (임시로 '제주' (region_id=1)를 기본값으로 사용)
     DEFAULT_REGION_ID = 1 
     
-    # 1. 실제 발전량 데이터(Kwh) 조회
     actual_query = select(
         models.GenerationTs.ts,
         (models.GenerationTs.generation_mwh * 1000).label("actual_kwh")
-    ).where(
-        models.GenerationTs.region_id == DEFAULT_REGION_ID,
-        models.GenerationTs.ts >= start_time,
-        models.GenerationTs.ts < end_time
-    )
+    ).where(models.GenerationTs.region_id == DEFAULT_REGION_ID)
     actual_results = await db.execute(actual_query)
     actual_data = {ts: actual_kwh for ts, actual_kwh in actual_results.all()}
 
-    # 2. 예측 발전량 데이터(Kwh) 조회
-    # (gen_pred_kwh가 이미 Kwh 단위라고 가정)
     predicted_query = select(
         models.ForecastTs.ts,
         models.ForecastTs.gen_pred_kwh
-    ).where(
-        models.ForecastTs.region_id == DEFAULT_REGION_ID,
-        models.ForecastTs.ts >= start_time,
-        models.ForecastTs.ts < end_time,
-        # TODO: (선택) 특정 모델 버전만 가져오도록 필터링
-        # models.ForecastTs.model == 'XGBoost', 
-    ).order_by(models.ForecastTs.generated_at.desc()) # 최신 예측 순
+    ).where(models.ForecastTs.region_id == DEFAULT_REGION_ID)\
+     .order_by(models.ForecastTs.generated_at.desc())
     
     predicted_results = await db.execute(predicted_query)
     
-    # 동일 시간(ts)에 여러 예측이 있다면, 가장 최신(generated_at) 예측만 사용
     predicted_data = {}
     for ts, pred_kwh in predicted_results.all():
         if ts not in predicted_data:
             predicted_data[ts] = pred_kwh
             
-    # 3. 데이터 취합
     response_list = []
-    for i in range(hours):
-        current_ts = start_time + timedelta(hours=i)
+    all_timestamps = sorted(list(set(actual_data.keys()) | set(predicted_data.keys())))
+
+    for current_ts in all_timestamps:
+        if len(response_list) >= 24:
+             break
         time_str = current_ts.strftime("%H:%M")
-        
         actual = actual_data.get(current_ts)
         predicted = predicted_data.get(current_ts)
-        
-        # 실제 또는 예측 데이터 둘 중 하나라도 존재하면 리스트에 추가
-        if actual is not None or predicted is not None:
-            response_list.append(schemas.PowerForecast(
-                time=time_str,
-                actual=round(actual, 2) if actual is not None else None,
-                predicted=round(predicted or 0.0, 2) # 예측값이 없으면 0.0으로
-            ))
-            
+        response_list.append(schemas.PowerForecast(
+            time=time_str,
+            actual=round(actual, 2) if actual is not None else None,
+            predicted=round(predicted or 0.0, 2)
+        ))
     return response_list
 
 async def check_region_exists(db: AsyncSession, region_name: str) -> bool:
-    """
-    DB에 해당 이름의 지역이 존재하는지 확인합니다. (CSV 다운로드 API용)
-    """
     query = select(models.Region).where(models.Region.name == region_name)
     result = await db.execute(query)
     return result.first() is not None
@@ -232,50 +174,171 @@ async def save_forecast_results(
     predictions: List[dict]
 ):
     """
-    AI 모델의 예측 결과를 `forecast_ts` 테이블에 저장합니다.
-    (UPSERT: 이미 데이터가 있으면 덮어쓰기)
+    AI 예측 결과를 DB에 저장 (UPSERT)
+    predictions: [{'ts': datetime, 'predicted_kwh': float}, ...]
     """
-    
-    # 1. DB에 저장할 객체(dict) 리스트 생성
+    if not predictions:
+        print("DB에 저장할 예측 결과가 없습니다.")
+        return
+
     objects_to_save = []
-    generated_at_time = datetime.utcnow() # 현재 시간 (UTC)
+    generated_at_time = datetime.utcnow()
 
     for pred in predictions:
-        # 프론트에서 온 'ts' 문자열을 datetime 객체로 변환
-        ts_datetime = datetime.fromisoformat(pred["ts"].replace("Z", "+00:00"))
-        
+        # 이미 datetime 객체라면 변환 건너뛰기, 문자열이면 변환
+        ts_val = pred["ts"]
+        if isinstance(ts_val, str):
+            ts_datetime = datetime.fromisoformat(ts_val.replace("Z", "+00:00"))
+        else:
+            ts_datetime = ts_val
+
         objects_to_save.append({
-            "ts": ts_datetime, # 예측 시각
+            "ts": ts_datetime,
             "region_id": region_id,
-            "horizon": 0, # (예시: horizon 계산 로직 필요시 추가)
+            "horizon": 0, # 필요시 horizon 계산 로직 추가
             "gen_pred_kwh": pred["predicted_kwh"],
             "model": model_name,
             "ver": model_ver,
-            "generated_at": generated_at_time # 예측 생성 시각
+            "generated_at": generated_at_time
         })
 
-    if not objects_to_save:
-        print("DB에 저장할 예측 결과가 없습니다.")
-        return # 저장할 것이 없으면 종료
-
-    # 2. `insert` 문 정의
-    # (SQLAlchemy 1.x 방식)
     stmt = insert(models.ForecastTs).values(objects_to_save)
-
-    # 3. "ON CONFLICT" (UPSERT) 정의
-    # (ts, region_id, horizon, model, ver)가 겹치면
-    # `gen_pred_kwh`와 `generated_at` 값을 새로 덮어쓰기
     stmt = stmt.on_conflict_do_update(
-        # 충돌 감지 기준 (forecast_ts의 복합 기본 키)
         index_elements=['ts', 'region_id', 'horizon', 'model', 'ver'],
-        # 덮어쓸 값
         set_={
             "gen_pred_kwh": stmt.excluded.gen_pred_kwh,
             "generated_at": stmt.excluded.generated_at
         }
     )
-
-    # 4. DB에 일괄 실행
     await db.execute(stmt)
     await db.commit()
     print(f"✅ 예측 결과 {len(objects_to_save)}건 DB 저장 완료")
+
+async def insert_dummy_sensor_data(db: AsyncSession, region_id: int):
+    """
+    (고지능 가짜 센서) 계절, 시간, 날씨 상태를 반영하여 
+    현실적인 더미 데이터를 생성하고 DB에 저장합니다.
+    """
+    now = datetime.now().replace(minute=0, second=0, microsecond=0)
+    month = now.month
+    hour = now.hour
+
+    # --- 1. 계절별 기본 설정 (기온, 일출/일몰, 최대 일사량) ---
+    if month in [12, 1, 2]:  # 겨울
+        base_temp = -2.0
+        base_humid = 40
+        sunrise, sunset = 7, 18
+        max_irr_season = 0.5
+    elif month in [6, 7, 8]:  # 여름
+        base_temp = 26.0
+        base_humid = 75
+        sunrise, sunset = 5, 20
+        max_irr_season = 0.9
+    elif month in [9, 10, 11]: # 가을
+        base_temp = 18.0
+        base_humid = 60
+        sunrise, sunset = 6, 19
+        max_irr_season = 0.7
+    else:  # 봄
+        base_temp = 15.0
+        base_humid = 55
+        sunrise, sunset = 6, 19
+        max_irr_season = 0.8
+
+    # --- 2. 시간대별 기온 변동 (Diurnal Cycle) ---
+    # 하루 중 14시에 가장 덥고, 새벽 4시에 가장 춥도록 코사인 곡선 적용
+    # 시간 차이(hour - 14)를 이용해 변동폭 -5도 ~ +5도 설정
+    temp_adjustment = 5 * -math.cos(math.pi * (hour - 4) / 12)
+    current_temp = base_temp + temp_adjustment + random.uniform(-1.5, 1.5)
+
+    # --- 3. 날씨 랜덤 이벤트 (맑음 70%, 흐림 20%, 비 10%) ---
+    weather_type = random.choices(['sunny', 'cloudy', 'rainy'], weights=[70, 20, 10])[0]
+
+    precip_mm = 0.0
+    snow_cm = 0.0
+    cloud_10 = 0
+    sunshine_hr = 0.0
+    solar_irr = 0.0
+    
+    # 낮 시간인지 확인
+    is_daytime = sunrise <= hour < sunset
+
+    if is_daytime:
+        # 태양 고도에 따른 일사량 계산 (정오에 피크인 포물선)
+        # day_progress: 0(일출) ~ 1(일몰)
+        day_progress = (hour - sunrise) / (sunset - sunrise)
+        # 포물선 공식 y = 4x(1-x) : x=0.5일 때 1이 됨
+        sun_intensity = 4 * day_progress * (1 - day_progress)
+        
+        solar_irr = max_irr_season * sun_intensity * random.uniform(0.9, 1.1)
+        sunshine_hr = 1.0 # 기본 1시간
+        
+    # 날씨에 따른 값 보정
+    if weather_type == 'cloudy':
+        cloud_10 = random.randint(5, 8)
+        solar_irr *= 0.4      # 흐리면 일사량 40%로 감소
+        sunshine_hr = 0.0     # 햇빛 없음
+        current_temp -= 1.0   # 기온 약간 하강
+    elif weather_type == 'rainy':
+        cloud_10 = random.randint(9, 10)
+        precip_mm = random.uniform(1.0, 15.0) # 비 옴
+        solar_irr = 0.0       # 비 오면 발전량 거의 없음
+        sunshine_hr = 0.0
+        current_temp -= 2.0   # 기온 하강
+        base_humid += 30      # 습도 대폭 상승
+
+    # 습도 최종 계산 (0~100 제한)
+    current_humid = min(100, max(0, base_humid + random.uniform(-10, 10)))
+
+    # --- 4. 발전량 계산 (물리 법칙 반영) ---
+    capacity = 100.0  # 설비 용량 100MW 가정
+    # 효율: 기온이 25도보다 높으면 효율이 떨어지는 태양광 패널 특성 반영
+    temp_efficiency_loss = max(0, (current_temp - 25) * 0.005) 
+    efficiency = 0.85 - temp_efficiency_loss + random.uniform(-0.02, 0.02)
+    
+    generation_mwh = solar_irr * capacity * efficiency
+    if generation_mwh < 0: generation_mwh = 0
+
+    # --- 5. DB 저장용 딕셔너리 생성 ---
+    dummy_weather = {
+        "ts": now,
+        "region_id": region_id,
+        "temp_c": round(current_temp, 1),
+        "precip_mm": round(precip_mm, 1),
+        "humidity": round(current_humid, 1),
+        "snow_cm": round(snow_cm, 1),
+        "cloud_10": cloud_10,
+        "sunshine_hr": round(sunshine_hr, 1),
+        "solar_irr": round(solar_irr, 2),
+    }
+
+    dummy_generation = {
+        "ts": now,
+        "region_id": region_id,
+        "capacity_mw": capacity,
+        "generation_mwh": round(generation_mwh, 2)
+    }
+
+    # --- 6. DB Insert (UPSERT) ---
+    stmt_weather = insert(models.WeatherTs).values(dummy_weather)
+    stmt_weather = stmt_weather.on_conflict_do_update(
+        index_elements=['ts', 'region_id'],
+        set_=dummy_weather
+    )
+    
+    stmt_gen = insert(models.GenerationTs).values(dummy_generation)
+    stmt_gen = stmt_gen.on_conflict_do_update(
+        index_elements=['ts', 'region_id'],
+        set_=dummy_generation
+    )
+
+    await db.execute(stmt_weather)
+    await db.execute(stmt_gen)
+    await db.commit()
+    
+    # 로그 출력
+    weather_desc = "☀️" if weather_type == 'sunny' else ("☁️" if weather_type == 'cloudy' else "🌧️")
+    if not is_daytime: weather_desc = "🌙"
+    
+    print(f"✅ [Dummy Sensor] {now.strftime('%H:%M')} {weather_desc} | "
+          f"기온: {current_temp:.1f}℃, 일사량: {solar_irr:.2f}, 발전량: {generation_mwh:.2f} MWh")
