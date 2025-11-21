@@ -21,7 +21,7 @@
 
 터미널을 2개 열고 각각 아래 명령어를 실행하세요.
 
- Terminal A: Celery Worker 
+**Terminal A: Celery Worker**
 실제 AI 예측 및 데이터 처리를 수행합니다.
 ```bash
 # Mac / Linux
@@ -29,7 +29,9 @@ celery -A celery_app worker --loglevel=info
 
 # Windows
 celery -A celery_app worker --loglevel=info -P solo
-
-Terminal B: Celery Beat (스케줄러)
-
+```
+**Terminal B: Celery Beat**
+```bash
 celery -A celery_app beat --loglevel=info
+```
+
