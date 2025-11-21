@@ -3,11 +3,17 @@ from typing import List, Optional, Dict, Any
 from datetime import datetime
 
 # (DashboardSummary, RegionPowerData, PowerForecast 클래스는 그대로)
+# schemas.py
+
 class DashboardSummary(BaseModel):
-    current_power: float
-    today_total: float
-    accuracy: float
-    today_date: str
+    """대시보드 요약 정보"""
+    current_power: float  # 현재 발전량 (Kw)
+    today_total: float    # 오늘의 누적 발전량 (Kwh)
+    today_revenue: int    
+    
+    accuracy: float       # 예측 정확도 (%)
+    today_date: str       # 오늘 날짜
+    
     class Config:
         from_attributes = True
 

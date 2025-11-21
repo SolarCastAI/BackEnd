@@ -5,7 +5,7 @@ from sqlalchemy.future import select
 from sqlalchemy import func, and_
 from sqlalchemy.dialects.postgresql import insert
 from typing import List, Optional, Dict
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta, date, timezone
 import random
 
 import models
@@ -17,20 +17,20 @@ import schemas
 async def get_training_data(db: AsyncSession, region_id: int, limit: int = 2000) -> pd.DataFrame:
     """
     AI 모델 학습/추론용 데이터를 DB에서 추출하여 DataFrame으로 반환합니다.
-    WeatherTs(기상)와 GenerationTs(발전량)를 시간(ts) 기준으로 조인합니다.
-    serving.py 모델이 사용하는 영문 컬럼명으로 반환합니다.
+    (수정됨) 과거 데이터가 아니라 '가장 최신 데이터'를 가져오도록 변경
     """
+    # 1. 쿼리 작성: 필요한 컬럼 선택 및 조인
     stmt = select(
-        models.WeatherTs.ts.label('datetime'),           # 발전일자 -> datetime
-        models.WeatherTs.temp_c.label('temperature'),    # 기온
-        models.WeatherTs.precip_mm.label('precipitation'), # 강우량
-        models.WeatherTs.humidity.label('humidity'),     # 습도
-        models.WeatherTs.snow_cm.label('snow'),          # 적설량
-        models.WeatherTs.cloud_10.label('cloud_cover'),  # 전운량
-        models.WeatherTs.sunshine_hr.label('sunshine_duration'), # 일조
-        models.WeatherTs.solar_irr.label('solar_radiation'),     # 일사량
-        models.GenerationTs.capacity_mw.label('solar_capacity'), # 설비용량
-        models.GenerationTs.generation_mwh.label('solar_generation') # 발전량
+        models.WeatherTs.ts.label('datetime'),
+        models.WeatherTs.temp_c.label('temperature'),
+        models.WeatherTs.precip_mm.label('precipitation'),
+        models.WeatherTs.humidity.label('humidity'),
+        models.WeatherTs.snow_cm.label('snow'),
+        models.WeatherTs.cloud_10.label('cloud_cover'),
+        models.WeatherTs.sunshine_hr.label('sunshine_duration'),
+        models.WeatherTs.solar_irr.label('solar_radiation'),
+        models.GenerationTs.capacity_mw.label('solar_capacity'),
+        models.GenerationTs.generation_mwh.label('solar_generation')
     ).join(
         models.GenerationTs,
         and_(
@@ -40,27 +40,33 @@ async def get_training_data(db: AsyncSession, region_id: int, limit: int = 2000)
     ).where(
         models.WeatherTs.region_id == region_id
     ).order_by(
-        models.WeatherTs.ts.asc() # 과거 -> 현재 순서 정렬
+        models.WeatherTs.ts.desc() # ⬅️ 중요: 최신순(DESC)으로 먼저 정렬
     )
     
+    # limit 적용 (최신 N개만 가져옴)
     if limit > 0:
         stmt = stmt.limit(limit)
 
+    # 2. 실행 및 결과 가져오기
     result = await db.execute(stmt)
     rows = result.all()
 
     if not rows:
-        return pd.DataFrame() 
+        print("⚠️ DB에서 가져온 데이터가 없습니다.")
+        return pd.DataFrame()
 
-    # DataFrame 변환 (컬럼명 명시)
+    # 3. DataFrame 변환
     df = pd.DataFrame(rows, columns=[
         'datetime', 'temperature', 'precipitation', 'humidity', 
         'snow', 'cloud_cover', 'sunshine_duration', 'solar_radiation', 
         'solar_capacity', 'solar_generation'
     ])
 
-    # 데이터 타입 보정
+    # 4. 데이터 타입 보정
     df['datetime'] = pd.to_datetime(df['datetime'])
+    
+    # 5. ⬅️ 중요: 모델은 시간 순서(과거->미래)가 필요하므로 다시 뒤집어줍니다.
+    df = df.sort_values('datetime').reset_index(drop=True)
     
     return df
 
@@ -68,24 +74,39 @@ async def get_training_data(db: AsyncSession, region_id: int, limit: int = 2000)
 # ================================================
 # 기존 Dashboard 및 데이터 조회 함수들
 # ================================================
+# crud.py
+
 async def get_dashboard_summary(db: AsyncSession) -> Dict:
     today = date.today()
-    today_total_query = select(func.sum(models.GenerationTs.generation_mwh * 1000)).where(func.date(models.GenerationTs.ts) == today)
+    
+    # 1. 발전량 조회
+    today_total_query = select(func.sum(models.GenerationTs.generation_mwh * 1000))\
+        .where(func.date(models.GenerationTs.ts) == today)
     today_total_result = await db.execute(today_total_query)
     today_total_kwh = today_total_result.scalar_one_or_none() or 0.0
     
-    current_power_query = select(models.GenerationTs.generation_mwh * 1000).order_by(models.GenerationTs.ts.desc()).limit(1)
+    # 2. 현재 발전량 조회
+    current_power_query = select(models.GenerationTs.generation_mwh * 1000)\
+        .order_by(models.GenerationTs.ts.desc())\
+        .limit(1)
     current_power_result = await db.execute(current_power_query)
     current_power_kw = current_power_result.scalar_one_or_none() or 0.0
 
-    accuracy_query = select(models.EvalDaily.mape).order_by(models.EvalDaily.date.desc()).limit(1)
+    # 3. 정확도 조회
+    accuracy_query = select(models.EvalDaily.mape)\
+        .order_by(models.EvalDaily.date.desc())\
+        .limit(1)
     accuracy_result = await db.execute(accuracy_query)
     mape = accuracy_result.scalar_one_or_none() or 0.0
     accuracy_percent = max(0.0, 100.0 - mape)
     
+    # 수익 계산 (발전량 * 174원)
+    today_revenue = int(today_total_kwh * 174)
+
     return {
         "current_power": round(current_power_kw, 1),
         "today_total": round(today_total_kwh, 0),
+        "today_revenue": today_revenue,  # 프론트로 수익 전달
         "accuracy": round(accuracy_percent, 1)
     }
 
@@ -120,45 +141,86 @@ async def get_regions_data(db: AsyncSession) -> List[schemas.RegionPowerData]:
         ))
     return response_list
 
+# (상단 import 확인)
+from datetime import datetime, timedelta, timezone
+
+# ... (다른 함수들) ...
+
 async def get_power_forecast(db: AsyncSession, hours: int) -> List[schemas.PowerForecast]:
-    now = datetime.now()
-    start_time = now.replace(minute=0, second=0, microsecond=0)
+    """
+    과거 24시간(실제) + 미래 N시간(예측) 데이터를 조회합니다. (문자열 Key 매칭 방식)
+    """
+    # 1. 기준 시간 설정 (UTC)
+    now = datetime.now(timezone.utc).replace(minute=0, second=0, microsecond=0)
+    
+    # 검색 범위: (어제 이 시간) ~ (내일/모레 이 시간)
+    start_time = now - timedelta(hours=24)
+    end_time = now + timedelta(hours=hours)
+    
     DEFAULT_REGION_ID = 1 
     
+    # 2. DB 조회
+    # 실제 발전량
     actual_query = select(
         models.GenerationTs.ts,
         (models.GenerationTs.generation_mwh * 1000).label("actual_kwh")
-    ).where(models.GenerationTs.region_id == DEFAULT_REGION_ID)
+    ).where(
+        models.GenerationTs.region_id == DEFAULT_REGION_ID,
+        models.GenerationTs.ts >= start_time,
+        models.GenerationTs.ts < end_time
+    )
     actual_results = await db.execute(actual_query)
-    actual_data = {ts: actual_kwh for ts, actual_kwh in actual_results.all()}
+    
+    # [핵심] 날짜를 문자열 키로 변환하여 저장 (예: "2025-11-21T10:00:00+00:00")
+    actual_data = {row.ts.isoformat(): row.actual_kwh for row in actual_results.all()}
 
+    # 예측 발전량
     predicted_query = select(
         models.ForecastTs.ts,
         models.ForecastTs.gen_pred_kwh
-    ).where(models.ForecastTs.region_id == DEFAULT_REGION_ID)\
-     .order_by(models.ForecastTs.generated_at.desc())
+    ).where(
+        models.ForecastTs.region_id == DEFAULT_REGION_ID,
+        models.ForecastTs.ts >= start_time,
+        models.ForecastTs.ts < end_time
+    ).order_by(models.ForecastTs.generated_at.desc())
     
     predicted_results = await db.execute(predicted_query)
     
+    # 예측 데이터도 문자열 키로 저장
     predicted_data = {}
     for ts, pred_kwh in predicted_results.all():
-        if ts not in predicted_data:
-            predicted_data[ts] = pred_kwh
+        iso_key = ts.isoformat()
+        if iso_key not in predicted_data:
+            predicted_data[iso_key] = pred_kwh
             
+    # 3. 데이터 취합 및 KST 변환
     response_list = []
-    all_timestamps = sorted(list(set(actual_data.keys()) | set(predicted_data.keys())))
+    kst_tz = timezone(timedelta(hours=9))
+    total_hours = 24 + hours 
+    
+    print(f"🔎 [Debug] 조회 범위: {start_time} ~ {end_time}")
+    print(f"   - DB 실제 데이터 개수: {len(actual_data)}개")
+    print(f"   - DB 예측 데이터 개수: {len(predicted_data)}개")
 
-    for current_ts in all_timestamps:
-        if len(response_list) >= 24:
-             break
-        time_str = current_ts.strftime("%H:%M")
-        actual = actual_data.get(current_ts)
-        predicted = predicted_data.get(current_ts)
+    for i in range(total_hours):
+        # 1시간씩 이동하며 Key 생성
+        current_ts_utc = start_time + timedelta(hours=i)
+        key = current_ts_utc.isoformat()
+        
+        # 딕셔너리에서 값 찾기 (문자열로 찾으니 정확함)
+        actual = actual_data.get(key)
+        predicted = predicted_data.get(key)
+        
+        # 화면 표시용 시간 (KST 변환)
+        current_ts_kst = current_ts_utc.astimezone(kst_tz)
+        time_str = current_ts_kst.strftime("%m/%d %H:%M")
+        
         response_list.append(schemas.PowerForecast(
             time=time_str,
             actual=round(actual, 2) if actual is not None else None,
             predicted=round(predicted or 0.0, 2)
         ))
+            
     return response_list
 
 async def check_region_exists(db: AsyncSession, region_name: str) -> bool:
@@ -342,3 +404,62 @@ async def insert_dummy_sensor_data(db: AsyncSession, region_id: int):
     
     print(f"✅ [Dummy Sensor] {now.strftime('%H:%M')} {weather_desc} | "
           f"기온: {current_temp:.1f}℃, 일사량: {solar_irr:.2f}, 발전량: {generation_mwh:.2f} MWh")
+    
+# 모델 예측 점수 
+async def calculate_daily_accuracy(db: AsyncSession, region_id: int):
+    """
+    [일일 평가] 어제 날짜의 '실제 vs 예측'을 비교하여 정확도를 계산하고 DB에 저장합니다.
+    """
+    # 1. 어제 날짜 구하기 (UTC 기준)
+    now = datetime.now(timezone.utc)
+    yesterday = (now - timedelta(days=1)).date()
+    
+    print(f"📝 [Evaluation] {yesterday} 일자 모델 성능 평가 시작...")
+
+    # 2. 어제 하루치 '실제 발전량' 총합 (MWh -> kWh 변환)
+    actual_query = select(func.sum(models.GenerationTs.generation_mwh * 1000))\
+        .where(
+            models.GenerationTs.region_id == region_id,
+            func.date(models.GenerationTs.ts) == yesterday
+        )
+    actual_total = (await db.execute(actual_query)).scalar() or 0.0
+
+    # 3. 어제 하루치 '예측 발전량' 총합 (kWh)
+    pred_query = select(func.sum(models.ForecastTs.gen_pred_kwh))\
+        .where(
+            models.ForecastTs.region_id == region_id,
+            func.date(models.ForecastTs.ts) == yesterday
+        )
+    pred_total = (await db.execute(pred_query)).scalar() or 0.0
+
+    # 4. 정확도 계산 (0으로 나누기 방지)
+    if actual_total == 0:
+        accuracy = 0.0 # 실제 발전량이 없으면 정확도 0 처리
+    else:
+        # 오차율 = |실제 - 예측| / 실제
+        error_rate = abs(actual_total - pred_total) / actual_total
+        accuracy = max(0, (1 - error_rate) * 100) # 100점 만점 환산
+
+    # 5. 점수 저장 (eval_daily 테이블)
+    eval_data = {
+        "date": yesterday,
+        "region_id": region_id,
+        "model": "XGBoost-Stack", # 사용 중인 모델명
+        "ver": "v1.0",
+        "mae": abs(actual_total - pred_total), # 오차 절대값
+        "rmse": 0.0, # (약식) 필요시 구현
+        "mape": 100 - accuracy, # 오차율(%)
+        "samples": 24 # 24시간 데이터
+    }
+
+    stmt = insert(models.EvalDaily).values(eval_data)
+    stmt = stmt.on_conflict_do_update(
+        index_elements=['date', 'region_id', 'model', 'ver'],
+        set_=eval_data
+    )
+    
+    await db.execute(stmt)
+    await db.commit()
+    
+    print(f"✅ [Evaluation] {yesterday} 평가 완료: 실제 {actual_total:.1f} vs 예측 {pred_total:.1f} -> 정확도 {accuracy:.1f}%")
+    return accuracy

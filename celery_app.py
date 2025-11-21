@@ -22,12 +22,12 @@ celery_app.conf.update(
 
 # 3. 주기적 작업(Beat) 설정
 celery_app.conf.beat_schedule = {
-    # 'predict-every-hour': {
-    #     'task': 'tasks.run_hourly_prediction',  # tasks.py의 함수 이름
-    #     # 'schedule': crontab(minute=0),          # 매시 정각(0분)마다 실행
-    #     'schedule': 60.0,                     # 테스트용: 60초마다 실행하려면 주석 해제 -> 테스트 완
-    #     'args': (1,)                            # region_id=1 (제주) 전달
-    # },
+    'predict-every-hour': {
+        'task': 'tasks.run_hourly_prediction',  # tasks.py의 함수 이름
+        'schedule': crontab(minute=0),          # 매시 정각(0분)마다 실행
+        #'schedule': 60.0,                     # 테스트용: 60초마다 실행하려면 주석 해제 -> 테스트 완
+        'args': (1,)                            # region_id=1 (제주) 전달
+    },
 
     'retrain-daily': {
         'task': 'tasks.run_daily_retraining',

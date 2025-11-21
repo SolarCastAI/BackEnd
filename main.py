@@ -56,6 +56,7 @@ async def get_dashboard_summary(db: AsyncSession = Depends(get_db)):
     return schemas.DashboardSummary(
         current_power=summary_data["current_power"],
         today_total=summary_data["today_total"],
+        today_revenue=summary_data["today_revenue"],
         accuracy=summary_data["accuracy"],
         today_date=datetime.now().strftime("%m/%d(%a)")
     )
@@ -65,8 +66,16 @@ async def get_regions_data(db: AsyncSession = Depends(get_db)):
     return await crud.get_regions_data(db)
 
 @app.get("/api/forecast/hourly", response_model=List[schemas.PowerForecast])
-async def get_hourly_forecast(db: AsyncSession = Depends(get_db)):
-    return await crud.get_power_forecast(db, hours=24)
+async def get_hourly_forecast(
+    hours: int = 24, # <-- (수정) 프론트엔드에서 시간을 지정할 수 있게 파라미터 추가
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    시간대별 발전량 예측 조회
+    URL 예시: /api/forecast/hourly?hours=48 (48시간 데이터 요청)
+    """
+    # crud 함수에 프론트엔드가 요청한 시간(hours)을 그대로 전달
+    return await crud.get_power_forecast(db, hours=hours)
 
 # ====================================
 # (Q1, Q2, Q3) AI 예측 및 DB 저장 API
