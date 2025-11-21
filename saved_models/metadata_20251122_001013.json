@@ -1,0 +1,69 @@
+{
+    "timestamp": "20251122_001013",
+    "feature_columns": [
+        "\uae30\uc628",
+        "\uac15\uc218\ub7c9(mm)",
+        "\uc2b5\ub3c4",
+        "\uc801\uc124(cm)",
+        "\uc804\uc6b4\ub7c9(10\ubd84\uc704)",
+        "\uc77c\uc870(hr)",
+        "\uc77c\uc0ac\ub7c9",
+        "\ud0dc\uc591\uad11 \uc124\ube44\uc6a9\ub7c9(MW)"
+    ],
+    "sequence_length": 24,
+    "device": "cuda",
+    "lstm_metrics": {
+        "mae": 13.37277603149414,
+        "rmse": 24.52490961056228,
+        "r2": 0.8400981426239014,
+        "mape_improved": 29.657376731463987,
+        "mape_threshold": 46.90165897955288,
+        "mape_weighted": 27.165815695812825,
+        "mape_symmetric": 60.181270983279056,
+        "normalized_mape": 4.477769753905833,
+        "nmae": 0.039051443338394165,
+        "nrmse": 0.07161812123499986
+    },
+    "gru_metrics": {
+        "mae": 12.826497077941895,
+        "rmse": 23.71945893003451,
+        "r2": 0.8504287004470825,
+        "mape_improved": 27.70748339577761,
+        "mape_threshold": 44.87917848254568,
+        "mape_weighted": 25.58748194278568,
+        "mape_symmetric": 59.12971186901119,
+        "normalized_mape": 4.258347700286266,
+        "nmae": 0.03745618835091591,
+        "nrmse": 0.06926602838724447
+    },
+    "stacked_metrics": {
+        "mae": 46.21873092651367,
+        "rmse": 61.60926800650106,
+        "r2": -0.009091973304748535,
+        "mape_improved": 68.16319762278052,
+        "mape_threshold": 77.39911406228082,
+        "mape_weighted": 64.74848072360673,
+        "mape_symmetric": 81.224188058205,
+        "normalized_mape": 13.820977591604667,
+        "nmae": 0.1349688470363617,
+        "nrmse": 0.1799125907232255
+    },
+    "model_files": {
+        "lstm": "lstm_model_20251112_193519.pth",
+        "gru": "gru_model_20251112_193519.pth",
+        "xgboost": "xgboost_stacking_20251112_193519.json",
+        "scalers": "scalers_20251112_193519.pkl"
+    },
+    "lstm_config": {
+        "input_size": 8,
+        "hidden_size": 128,
+        "num_layers": 2,
+        "dropout": 0.2
+    },
+    "gru_config": {
+        "input_size": 8,
+        "hidden_size": 128,
+        "num_layers": 2,
+        "dropout": 0.2
+    }
+}

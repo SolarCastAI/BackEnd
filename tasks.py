@@ -85,7 +85,9 @@ def run_daily_retraining(region_id: int):
     async def _process():
         async with async_session() as db:
             try:
-                # 1. 학습 데이터 조회 (지난 30일치 정도? limit=2000개면 충분)
+                # 1. 어제 모델 성적표 채점하기 📝
+                await crud.calculate_daily_accuracy(db, region_id)
+                # 2. 학습 데이터 조회 (지난 30일치 정도? limit=2000개면 충분)
                 print("   1. 학습용 데이터 조회 중...")
                 # limit을 넉넉하게 잡아서 가져옵니다.
                 df_train = await crud.get_training_data(db, region_id, limit=3000)
@@ -94,7 +96,7 @@ def run_daily_retraining(region_id: int):
                     print("   ⚠️ 데이터가 너무 적어 재학습을 건너뜁니다.")
                     return "Skipped: Not enough data"
 
-                # 2. serving.py의 재학습 함수 호출 (동기 함수이므로 바로 호출)
+                # 3. serving.py의 재학습 함수 호출 (동기 함수이므로 바로 호출)
                 # (GPU가 있다면 여기서 시간이 좀 걸립니다)
                 print(f"   2. 모델 재학습 시작 (데이터 {len(df_train)}건)...")
                 success = serving.retrain_model(df_train)
