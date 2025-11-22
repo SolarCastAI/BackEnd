@@ -1,10 +1,21 @@
 # solarcastai/backend/.../tasks.py
+import sys
+import os
+from dotenv import load_dotenv
 import asyncio
 import pandas as pd
 from celery_app import celery_app
 from database import async_session
 import crud
 import serving
+
+
+load_dotenv()
+
+# Windows 이벤트 루프 설정
+if sys.platform == "win32":
+    import asyncio
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 # 비동기(async) 함수를 Celery(동기)에서 실행하기 위한 래퍼 함수
 def run_async(coro):
