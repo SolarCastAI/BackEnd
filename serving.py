@@ -149,8 +149,19 @@ def transfer_learning(model, train_loader, val_loader, criterion,
 def predict_future(model, scaler_X, scaler_y, last_sequence, target_datetime, solar_capacity, device='cpu'):
     """단일 시점 미래 예측"""
     model.eval()
-    month = target_datetime.month
-    hour = target_datetime.hour
+    
+    # UTC -> KST 변환하여 시간 계산
+    from datetime import timezone, timedelta
+    kst_tz = timezone(timedelta(hours=9))
+    
+    # target_datetime이 UTC라면 KST로 변환
+    if target_datetime.tzinfo is None:
+        target_kst = target_datetime  # timezone 없으면 그대로 사용
+    else:
+        target_kst = target_datetime.astimezone(kst_tz)
+    
+    month = target_kst.month
+    hour = target_kst.hour  # ← KST 기준 시간!
     
     # 계절별/시간대별 기상 패턴 생성 (간략화)
     if month in [11, 12, 1, 2]: base_temp, base_humid, base_cloud = 5, 60, 5
@@ -162,6 +173,7 @@ def predict_future(model, scaler_X, scaler_y, last_sequence, target_datetime, so
     elif 12 < hour <= 18: temperature = base_temp + 9 - (hour - 12) * 1.0
     else: temperature = base_temp - 3
     
+    # KST 기준으로 낮/밤 판단
     if 6 <= hour <= 18:
         sunshine_duration = 0.8 if 9 <= hour <= 15 else 0.3
         solar_radiation = 600 if 9 <= hour <= 15 else 200
@@ -338,7 +350,7 @@ def run_prediction(df_input, loaded_models=None):
                 '예측일시': target_time,
                 '앙상블_발전량(MWh)': max(0, ensemble_pred)
             })
-            
+
         return all_predictions
 
     except Exception as e:
