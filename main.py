@@ -1,7 +1,7 @@
 import pandas as pd
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List
+from typing import List, Optional
 from datetime import datetime
 import asyncio
 
@@ -14,11 +14,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 # --- 서버 시작 시 모델 로드 ---
 try:
-    models_ai = serving.load_jeju_pretrained_models() 
+    lstm_model, gru_model, scaler_X, scaler_y = serving.preload_models()
     print("✅ AI 모델 로딩 성공!")
+    models_loaded = True
 except Exception as e:
     print(f"❌ AI 모델 로딩 실패: {e}")
-    models_ai = None
+    models_loaded = False
+    lstm_model = gru_model = scaler_X = scaler_y = None
 
 app = FastAPI(title="SolarCast API")
 
@@ -50,14 +52,18 @@ async def get_db() -> AsyncSession:
 def read_root():
     return {"message": "SolarCast API"}
 
+# [수정] region_id 쿼리 파라미터 받기 (기본값 1)
 @app.get("/api/dashboard/summary", response_model=schemas.DashboardSummary)
-async def get_dashboard_summary(db: AsyncSession = Depends(get_db)):
-    summary_data = await crud.get_dashboard_summary(db)
+async def get_dashboard_summary(
+    region_id: int = 1, 
+    db: AsyncSession = Depends(get_db)
+):
+    summary_data = await crud.get_dashboard_summary(db, region_id)
     return schemas.DashboardSummary(
         current_power=summary_data["current_power"],
         today_total=summary_data["today_total"],
-        today_revenue=summary_data["today_revenue"],
         accuracy=summary_data["accuracy"],
+        today_revenue=summary_data["today_revenue"], # 수익 추가
         today_date=datetime.now().strftime("%m/%d(%a)")
     )
 
@@ -65,73 +71,89 @@ async def get_dashboard_summary(db: AsyncSession = Depends(get_db)):
 async def get_regions_data(db: AsyncSession = Depends(get_db)):
     return await crud.get_regions_data(db)
 
+# [수정] region_id 쿼리 파라미터 받기
 @app.get("/api/forecast/hourly", response_model=List[schemas.PowerForecast])
 async def get_hourly_forecast(
-    hours: int = 24, # <-- (수정) 프론트엔드에서 시간을 지정할 수 있게 파라미터 추가
+    hours: int = 24, 
+    region_id: int = 1, 
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    시간대별 발전량 예측 조회
-    URL 예시: /api/forecast/hourly?hours=48 (48시간 데이터 요청)
-    """
-    # crud 함수에 프론트엔드가 요청한 시간(hours)을 그대로 전달
-    return await crud.get_power_forecast(db, hours=hours)
+    return await crud.get_power_forecast(db, hours=hours, region_id=region_id)
 
 # ====================================
-# (Q1, Q2, Q3) AI 예측 및 DB 저장 API
+# (수정됨) AI 예측 및 DB 저장 API
 # ====================================
+
 @app.post("/predict", response_model=schemas.PredictionResponse)
 async def predict(
     request: schemas.PredictionRequest, 
     db: AsyncSession = Depends(get_db)
 ):
-    """
-    1. DB에서 최근 데이터를 가져와 DataFrame 생성
-    2. serving.py의 run_prediction 함수로 예측 수행
-    3. 결과를 DB에 저장하고 응답 반환
-    """
-    if not models_ai:
+    if not models_loaded:
         raise HTTPException(status_code=503, detail="AI 모델이 로드되지 않았습니다.")
 
     # --- 1. DB에서 AI 입력 데이터 가져오기 ---
     try:
-        # request.sequence_length 만큼의 데이터를 가져오려면, 
-        # DB에서는 그보다 조금 넉넉하게 가져와서 serving.py에서 처리하는 것이 안전합니다.
-        features_df = await crud.get_training_data(
+        # (crud.py는 그대로 사용 가능)
+        features_df = await crud.get_features_for_prediction(
             db=db, 
             region_id=request.region_id, 
-            limit=500 # 최근 500개 데이터를 가져옴 (충분한 시퀀스 확보용)
+            sequence_length=request.sequence_length
         )
-        
         if features_df.empty:
-            raise ValueError(f"DB(region_id: {request.region_id})에 데이터가 없습니다.")
+            raise ValueError(f"예측에 필요한 데이터가 DB(region_id: {request.region_id})에 부족합니다.")
             
     except Exception as e:
-        print(f"❌ DB 데이터 조회 실패: {e}")
-        raise HTTPException(status_code=500, detail=f"DB 데이터 조회 실패: {e}")
+        print(f"❌ DB 조회 중 오류: {e}")
+        raise HTTPException(status_code=500, detail=f"DB 조회 실패: {e}")
 
-    # --- 2. AI 추론 실행 ---
+    # --- 2. AI 추론 실행 (수정됨) ---
     try:
-        # serving.py의 run_prediction 호출 (DataFrame 전달)
-        ai_results = serving.run_prediction(
-            df_input=features_df,
-            loaded_models=models_ai
+        # serving.py의 predict_future_daegu 함수 호출
+        # 이 함수는 (lstm, gru, scaler_X, scaler_y, data_sequence, ...)를 인자로 받습니다.
+        
+        # DataFrame을 numpy array로 변환 (입력 데이터)
+        # (주의: serving.py의 feature_columns 순서와 crud.py의 조회 순서가 일치해야 함)
+        input_data = features_df.values 
+        
+        # 예측 실행
+        # (predict_future_daegu는 내부적으로 24시간을 예측하도록 되어 있음)
+        ai_results = serving.predict_future_daegu(
+            lstm_model=lstm_model,
+            gru_model=gru_model,
+            scaler_X=scaler_X,
+            scaler_y=scaler_y,
+            data_sequence=input_data,
+            solar_capacity=446.0, # (임시: 설비용량. DB에서 가져오거나 상수로 지정)
+            hours_ahead=24 # 24시간 예측
         )
-        # ai_results = [{'예측일시': datetime, '앙상블_발전량(MWh)': float}, ...]
+        # ai_results = [{'time': '10:00', 'lstm': ..., 'gru': ..., 'ensemble': ...}, ...]
 
     except Exception as e:
         print(f"❌ AI 추론 중 오류: {e}")
         raise HTTPException(status_code=500, detail=f"AI 추론 실패: {e}")
 
-    # --- 3. 결과 데이터 변환 (List[Dict] -> DB Schema) ---
+    # --- 3. 결과 변환 ---
     try:
         predictions_list = []
-        model_info = {"model": "XGBoost-Stack", "version": "20251112"} # 메타데이터 예시
+        model_info = {"model": "Daegu-Transfer-Ensemble", "version": "20251130"}
+        
+        # 현재 시간 (기준)
+        base_time = datetime.utcnow()
+        # 오늘 날짜 (문자열 '10:00'에 날짜를 붙여주기 위함)
+        today_str = base_time.strftime("%Y-%m-%d")
 
         for item in ai_results:
+            # item['time']은 '10:00' 같은 문자열임. 날짜를 붙여서 datetime으로 만듦
+            time_str = f"{today_str} {item['time']}:00"
+            
+            # (만약 내일 시간으로 넘어갔다면 날짜 하루 추가 로직이 필요할 수 있음)
+            # 여기서는 간단히 처리
+            
             predictions_list.append({
-                "ts": item['예측일시'], # 이미 datetime 객체임
-                "predicted_kwh": float(item['앙상블_발전량(MWh)']) * 1000 # MWh -> kWh 변환 필요시 확인 (일단 값 그대로 사용 시 1000 곱하기 제거)
+                "ts": time_str, # ISO 포맷이 아니어도 fromisoformat이 처리 가능할 수 있음
+                # 앙상블 결과를 최종 예측값으로 사용
+                "predicted_kwh": float(item['ensemble'])
             })
 
         if not predictions_list:
@@ -158,7 +180,7 @@ async def predict(
     response_data = []
     for p in predictions_list:
         response_data.append({
-            "ts": p["ts"].isoformat(),
+            "ts": p["ts"], # (혹은 ISO 포맷으로 변환)
             "predicted_kwh": p["predicted_kwh"]
         })
 
@@ -166,10 +188,6 @@ async def predict(
         status="success",
         data=response_data
     )
-
-@app.get("/health")
-def health_check():
-    return {"status": "healthy"}
 
 if __name__ == "__main__":
     import uvicorn
